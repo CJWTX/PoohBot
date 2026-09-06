@@ -89,4 +89,4 @@ after changes take effect constitutes acceptance of the revised policy.
 ## 9. Contact
 
 Questions about this Privacy Policy, or requests regarding your data, can
-be directed to **connor@cjwitmer.com**.
+be directed to **poohbot@poohstrnak.com**.
