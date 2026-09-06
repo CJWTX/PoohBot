@@ -121,4 +121,4 @@ without regard to its conflict of law principles.
 
 ## 12. Contact
 
-Questions about these Terms can be directed to **Connor@cjwitmer.com**.
+Questions about these Terms can be directed to **poohbot@poohstrnak.com**.
