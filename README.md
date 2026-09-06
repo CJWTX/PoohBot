@@ -8,6 +8,8 @@ mod-to-user DMs, bulk cleanup) live alongside it.
 Built with `discord.py`. Data is stored locally in SQLite — no external
 database or paid services required.
 
+To add poohbot to your server: [Click this link](https://discord.com/oauth2/authorize?client_id=1503890279089045646&permissions=8&integration_type=0&scope=bot)
+
 ## Features
 
 **Reporting**
