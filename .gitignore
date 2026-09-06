@@ -1,0 +1,5 @@
+reportbot.db
+*.env
+token.env
+venv/
+__pycache__/
