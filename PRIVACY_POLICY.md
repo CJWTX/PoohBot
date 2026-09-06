@@ -71,7 +71,7 @@ request deletion of personal data associated with you. Because report and
 warning data is managed by each individual Discord server's moderators,
 requests to access or delete your data should generally start with that
 server's administrators, who can use the Bot's commands directly. For
-data-deletion requests we would need to handle directly, contact **connor@cjwitmer.com**.
+data-deletion requests we would need to handle directly, contact **poohbot@poohstrnak.com**.
 
 ## 7. Children's Privacy
 
