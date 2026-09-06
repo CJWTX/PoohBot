@@ -3,15 +3,9 @@
 **Last updated: 6 September 2026**
 
 This Privacy Policy explains what data **PoohBot** (the "Bot") collects,
-how it is used, and how it is stored. The Bot is operated by **[YOUR NAME /
-ORGANIZATION]** ("we," "us," or "our"). By adding the Bot to a Discord
+how it is used, and how it is stored. The Bot is operated by **Poohstrnak** ("we," "us," or "our"). By adding the Bot to a Discord
 server or interacting with it, you acknowledge the practices described
 here.
-
-> **Note:** This is a general-purpose template reflecting the data the Bot
-> actually collects, based on its current features. It is not legal advice.
-> Review it — and ideally have a lawyer review it — before publishing, and
-> fill in every `[BRACKETED]` placeholder.
 
 ## 1. Data We Collect
 
@@ -77,8 +71,7 @@ request deletion of personal data associated with you. Because report and
 warning data is managed by each individual Discord server's moderators,
 requests to access or delete your data should generally start with that
 server's administrators, who can use the Bot's commands directly. For
-data-deletion requests we would need to handle directly, contact **[CONTACT
-EMAIL]**.
+data-deletion requests we would need to handle directly, contact **connor@cjwitmer.com**.
 
 ## 7. Children's Privacy
 
@@ -96,4 +89,4 @@ after changes take effect constitutes acceptance of the revised policy.
 ## 9. Contact
 
 Questions about this Privacy Policy, or requests regarding your data, can
-be directed to **[CONTACT EMAIL]**.
+be directed to **connor@cjwitmer.com**.
