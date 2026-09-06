@@ -1,6 +1,6 @@
 # Privacy Policy
 
-**Last updated: [DATE]**
+**Last updated: 6 September 2026**
 
 This Privacy Policy explains what data **PoohBot** (the "Bot") collects,
 how it is used, and how it is stored. The Bot is operated by **[YOUR NAME /
