@@ -1,8 +1,8 @@
 # Terms of Service
 
-**Last updated: 6 September 2026**
+**Last updated: 8 September 2026**
 
-These Terms of Service ("Terms") govern your use of **[BOT NAME]** (the "Bot"),
+These Terms of Service ("Terms") govern your use of **PoohBot** (the "Bot"),
 a Discord bot operated by Poohstrnak ("we," "us," or
 "our"). By adding the Bot to a Discord server or otherwise interacting with
 it, you agree to these Terms. If you do not agree, do not use the Bot.
@@ -11,9 +11,9 @@ it, you agree to these Terms. If you do not agree, do not use the Bot.
 
 The Bot provides server moderation tools, including but not limited to:
 message reporting, case tracking, moderator action buttons (resolve,
-dismiss, timeout, warn, delete), pin request approval, moderator-to-user
-direct messaging, and related administrative commands. The Bot operates
-within Discord and is subject to
+dismiss, timeout, warn, delete), pin request approval, a reaction-based
+quote board, moderator-to-user direct messaging, and related administrative
+commands. The Bot operates within Discord and is subject to
 [Discord's Terms of Service](https://discord.com/terms) and
 [Community Guidelines](https://discord.com/guidelines) in addition to these
 Terms.
@@ -64,6 +64,8 @@ a database:
 - Warning records: the warned user's ID, the issuing moderator's ID, the
   reason given, and the timestamp.
 - Pin request data: the requesting user's ID and the message referenced.
+- Quote data: the content (and any image) of messages saved via the quote
+  board, the author's ID, the ID of the user who saved it, and timestamps.
 - Direct messages relayed between moderators and users through the Bot's
   messaging feature.
 - Server configuration settings (e.g., designated channels and roles).
@@ -81,9 +83,10 @@ applicable privacy laws.
 ## 6. Data Deletion
 
 Server administrators may delete stored report and warning data at any
-time using the Bot's cleanup commands. Removing the Bot from a server does
-not automatically delete previously stored data; contact **[CONTACT
-EMAIL]** to request deletion of a server's data from our systems.
+time using the Bot's cleanup commands, and individual quotes via
+`/delquote`. Removing the Bot from a server does not automatically delete
+previously stored data; contact **poohbot@poohstrnak.com** to request
+deletion of a server's data from our systems.
 
 ## 7. No Warranty
 

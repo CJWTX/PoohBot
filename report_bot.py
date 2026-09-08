@@ -18,7 +18,10 @@ FEATURES
   - Mod action buttons on every report: Resolve, Dismiss, Escalate,
     Delete Message, Timeout, Warn
   - /reports @user - moderation history (times reported + warnings)
-  - /setreportchannel and /setoncallrole - per-server config
+  - Quote board: react 💬 to any message to save it as a numbered quote,
+    then recall it with ".q 12" (or /quote), browse with /quotes,
+    search text with ".q s <keyword>"
+  - /setreportchannel, /setoncallrole, /setnoquoterole - per-server config
 
 SETUP
 1. pip install -U discord.py     (sqlite3 is in the Python standard library)
@@ -27,6 +30,9 @@ SETUP
    - Permissions needed: View Channels, Send Messages, Embed Links,
      Manage Messages (for the Delete button), Moderate Members (for
      the Timeout button), Create Public Threads
+   - IMPORTANT: on the Bot page, turn ON "Message Content Intent".
+     It's required for the ".q" text command to be visible to the bot.
+     (Everything else works without it; slash commands are unaffected.)
 3. export DISCORD_BOT_TOKEN="your-token-here"
    (optional) export TEST_GUILD_ID="your-server-id"   for instant command sync while testing
 4. Run: python report_bot.py
@@ -38,6 +44,8 @@ for server config, "Manage Server") permission on the person clicking.
 """
 
 import os
+import random
+import re
 import sqlite3
 import time
 from datetime import datetime, timedelta, timezone
@@ -126,11 +134,38 @@ def init_db():
             created_at TEXT
         )"""
     )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS quotes (
+            quote_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            guild_id INTEGER,
+            quote_number INTEGER,
+            message_id INTEGER,
+            channel_id INTEGER,
+            author_id INTEGER,
+            author_name TEXT,
+            content TEXT,
+            image_url TEXT,
+            jump_url TEXT,
+            saved_by_id INTEGER,
+            message_created_at TEXT,
+            created_at TEXT
+        )"""
+    )
+    # quote_number is per-server (each guild counts from #1), and a given
+    # message can only ever be quoted once.
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_quotes_guild_number ON quotes (guild_id, quote_number)"
+    )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_quotes_guild_message ON quotes (guild_id, message_id)"
+    )
     conn.commit()
     conn.close()
     _migrate_add_column("guild_config", "pin_request_channel_id", "INTEGER")
     _migrate_add_column("guild_config", "dm_channel_id", "INTEGER")
     _migrate_add_column("guild_config", "simonsays_role_id", "INTEGER")
+    _migrate_add_column("guild_config", "simonsays_log_channel_id", "INTEGER")
+    _migrate_add_column("guild_config", "no_quote_role_id", "INTEGER")
 
 
 def _migrate_add_column(table: str, column: str, col_type: str):
@@ -253,6 +288,28 @@ def set_simonsays_role(guild_id: int, role_id: int):
         "INSERT INTO guild_config (guild_id, simonsays_role_id) VALUES (?, ?) "
         "ON CONFLICT(guild_id) DO UPDATE SET simonsays_role_id = excluded.simonsays_role_id",
         (guild_id, role_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def set_no_quote_role(guild_id: int, role_id: int):
+    conn = db_connect()
+    conn.execute(
+        "INSERT INTO guild_config (guild_id, no_quote_role_id) VALUES (?, ?) "
+        "ON CONFLICT(guild_id) DO UPDATE SET no_quote_role_id = excluded.no_quote_role_id",
+        (guild_id, role_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def set_simonsays_log_channel(guild_id: int, channel_id: int):
+    conn = db_connect()
+    conn.execute(
+        "INSERT INTO guild_config (guild_id, simonsays_log_channel_id) VALUES (?, ?) "
+        "ON CONFLICT(guild_id) DO UPDATE SET simonsays_log_channel_id = excluded.simonsays_log_channel_id",
+        (guild_id, channel_id),
     )
     conn.commit()
     conn.close()
@@ -434,6 +491,134 @@ def get_history(guild_id: int, user_id: int) -> dict:
     return {"reported_count": reported_count, "recent_reports": recent_reports, "warnings": warnings}
 
 
+# ---------- quotes ----------
+
+QUOTE_INSERT_SQL = """INSERT INTO quotes
+    (guild_id, quote_number, message_id, channel_id, author_id, author_name,
+     content, image_url, jump_url, saved_by_id, message_created_at, created_at)
+    VALUES (:guild_id, :quote_number, :message_id, :channel_id, :author_id,
+            :author_name, :content, :image_url, :jump_url, :saved_by_id,
+            :message_created_at, :created_at)"""
+
+
+def create_quote(**fields):
+    """Saves a message as a quote. Returns (quote_number, created); created is
+    False when the message was already quoted, in which case the existing
+    number comes back instead."""
+    conn = db_connect()
+    try:
+        def already_quoted():
+            return conn.execute(
+                "SELECT quote_number FROM quotes WHERE guild_id = ? AND message_id = ?",
+                (fields["guild_id"], fields["message_id"]),
+            ).fetchone()
+
+        existing = already_quoted()
+        if existing is not None:
+            return existing["quote_number"], False
+
+        # Retry loop: two people can react at the same instant and race for the
+        # same quote number — the unique index rejects the loser, who retries.
+        for _ in range(5):
+            next_number = conn.execute(
+                "SELECT COALESCE(MAX(quote_number), 0) + 1 FROM quotes WHERE guild_id = ?",
+                (fields["guild_id"],),
+            ).fetchone()[0]
+            try:
+                conn.execute(QUOTE_INSERT_SQL, {**fields, "quote_number": next_number})
+                conn.commit()
+                return next_number, True
+            except sqlite3.IntegrityError:
+                conn.rollback()
+                existing = already_quoted()
+                if existing is not None:
+                    return existing["quote_number"], False
+        return None, False
+    finally:
+        conn.close()
+
+
+def get_quote(guild_id: int, quote_number: int):
+    conn = db_connect()
+    row = conn.execute(
+        "SELECT * FROM quotes WHERE guild_id = ? AND quote_number = ?", (guild_id, quote_number)
+    ).fetchone()
+    conn.close()
+    return row
+
+
+def get_quotes(guild_id: int, author_id: int = None):
+    conn = db_connect()
+    if author_id is None:
+        rows = conn.execute(
+            "SELECT * FROM quotes WHERE guild_id = ? ORDER BY quote_number", (guild_id,)
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM quotes WHERE guild_id = ? AND author_id = ? ORDER BY quote_number",
+            (guild_id, author_id),
+        ).fetchall()
+    conn.close()
+    return rows
+
+
+def search_quotes(guild_id: int, keyword: str):
+    conn = db_connect()
+    # Escape LIKE wildcards in the keyword so e.g. searching for "50%" doesn't
+    # match everything.
+    escaped = keyword.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    rows = conn.execute(
+        "SELECT * FROM quotes WHERE guild_id = ? AND content LIKE ? ESCAPE '\\' ORDER BY quote_number",
+        (guild_id, f"%{escaped}%"),
+    ).fetchall()
+    conn.close()
+    return rows
+
+
+def get_random_quote(guild_id: int, author_id: int = None):
+    rows = get_quotes(guild_id, author_id)
+    return random.choice(rows) if rows else None
+
+
+def delete_quote(guild_id: int, quote_number: int) -> bool:
+    conn = db_connect()
+    cur = conn.execute(
+        "DELETE FROM quotes WHERE guild_id = ? AND quote_number = ?", (guild_id, quote_number)
+    )
+    conn.commit()
+    deleted = cur.rowcount > 0
+    conn.close()
+    return deleted
+
+
+def renumber_quotes(guild_id: int) -> int:
+    """Closes gaps in quote numbering (e.g. after deletes) so numbers run
+    1..N in their existing order. Returns how many quotes actually moved."""
+    conn = db_connect()
+    rows = conn.execute(
+        "SELECT quote_id, quote_number FROM quotes WHERE guild_id = ? ORDER BY quote_number",
+        (guild_id,),
+    ).fetchall()
+
+    # Two-phase renumber: first shove everything onto negative, per-row-unique
+    # numbers so the (guild_id, quote_number) unique index never collides
+    # while numbers are shifting, then assign the final sequential values.
+    for row in rows:
+        conn.execute(
+            "UPDATE quotes SET quote_number = ? WHERE quote_id = ?", (-row["quote_id"], row["quote_id"])
+        )
+
+    changed = 0
+    for i, row in enumerate(rows, start=1):
+        if row["quote_number"] != i:
+            changed += 1
+        conn.execute("UPDATE quotes SET quote_number = ? WHERE quote_id = ?", (i, row["quote_id"]))
+
+    conn.commit()
+    conn.close()
+    return changed
+
+
 # ---------- rate limiting (in-memory) ----------
 
 _report_timestamps: dict = {}
@@ -452,10 +637,38 @@ def record_report_attempt(guild_id: int, user_id: int):
     _report_timestamps.setdefault(key, []).append(time.time())
 
 
+# ---------- "good bot" easter egg ----------
+
+GOOD_BOT_COOLDOWN_SECONDS = 300  # 5 minutes
+_good_bot_last_reply: dict = {}  # channel_id -> last reply timestamp
+
+
+def _is_good_bot(content: str) -> bool:
+    return re.fullmatch(r"good bot[!.?]*", content.strip(), re.IGNORECASE) is not None
+
+
+async def maybe_reply_good_bot(message: discord.Message):
+    if not _is_good_bot(message.content):
+        return
+    now = time.time()
+    last = _good_bot_last_reply.get(message.channel.id, 0)
+    if now - last < GOOD_BOT_COOLDOWN_SECONDS:
+        return
+    _good_bot_last_reply[message.channel.id] = now
+    try:
+        await message.channel.send("no u")
+    except (discord.Forbidden, discord.HTTPException):
+        pass
+
+
 # ---------- bot setup ----------
 
 intents = discord.Intents.default()
-bot = commands.Bot(command_prefix="!", intents=intents)
+# Required for text commands like ".q 12" — the bot can't see message text
+# without it. Enable "Message Content Intent" on the bot's page in the
+# Discord developer portal or login will fail with PrivilegedIntentsRequired.
+intents.message_content = True
+bot = commands.Bot(command_prefix=(".", "!"), intents=intents, case_insensitive=True)
 
 
 def is_mod(interaction: discord.Interaction) -> bool:
@@ -500,6 +713,25 @@ def dm_channel_for(guild_id: int):
     return None
 
 
+def no_quote_role_id_for(guild_id: int):
+    """Returns the role id whose members' messages are exempt from 💬
+    quote-saving, or None if no such role is configured."""
+    row = get_config(guild_id)
+    if row is None:
+        return None
+    return row["no_quote_role_id"]
+
+
+def simonsays_log_channel_for(guild_id: int):
+    """Returns the configured /simonsays log channel, or None if it hasn't
+    been set — logging is opt-in, so unlike other channels there's no
+    fallback to the report channel."""
+    row = get_config(guild_id)
+    if row is None or row["simonsays_log_channel_id"] is None:
+        return None
+    return bot.get_channel(row["simonsays_log_channel_id"])
+
+
 # ---------- embed building ----------
 
 def build_report_embed(case_id: int, row_data: dict, duplicate_count: int = 1) -> discord.Embed:
@@ -527,6 +759,37 @@ def build_report_embed(case_id: int, row_data: dict, duplicate_count: int = 1) -
         embed.add_field(name="Reported by", value=f"{duplicate_count} users total", inline=False)
     embed.add_field(name="Status", value="🟡 Open", inline=False)
     embed.set_footer(text=f"Case #{case_id}")
+    return embed
+
+
+def _format_short_datetime(dt: datetime) -> str:
+    """e.g. 5/8/26, 6:58 PM — avoids strftime's non-portable no-pad flags (%-d etc)."""
+    hour = dt.hour % 12 or 12
+    ampm = "AM" if dt.hour < 12 else "PM"
+    return f"{dt.month}/{dt.day}/{dt.year % 100}, {hour}:{dt.minute:02d} {ampm}"
+
+
+def build_quote_embed(row) -> discord.Embed:
+    content = row["content"] or "*[no text content]*"
+
+    mention = f"<@{row['author_id']}>" if row["author_id"] else (row["author_name"] or "Unknown user")
+    line = f"• {mention}"
+    if row["jump_url"]:
+        line += f" ([Jump]({row['jump_url']}))"
+
+    embed = discord.Embed(
+        title=f"#{row['quote_number']}",
+        description=f"{content[:3900]}\n{line}",
+    )
+    if row["image_url"]:
+        embed.set_image(url=row["image_url"])
+
+    if row["message_created_at"]:
+        try:
+            timestamp = datetime.fromisoformat(row["message_created_at"])
+            embed.set_footer(text=_format_short_datetime(timestamp))
+        except ValueError:
+            pass
     return embed
 
 
@@ -936,6 +1199,21 @@ async def simon_says(interaction: discord.Interaction, text: str):
     await interaction.channel.send(text)
     await interaction.response.send_message("Said it.", ephemeral=True)
 
+    log_channel = simonsays_log_channel_for(interaction.guild_id)
+    if log_channel is not None:
+        embed = discord.Embed(
+            title="🗣️ /simonsays used",
+            description=text,
+            color=discord.Color.blurple(),
+            timestamp=datetime.now(timezone.utc),
+        )
+        embed.add_field(name="Used by", value=interaction.user.mention, inline=True)
+        embed.add_field(name="Channel", value=interaction.channel.mention, inline=True)
+        try:
+            await log_channel.send(embed=embed)
+        except (discord.Forbidden, discord.HTTPException):
+            pass  # logging is best-effort — don't fail the command over it
+
 
 @simon_says.error
 async def simon_says_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
@@ -951,6 +1229,14 @@ async def simon_says_error(interaction: discord.Interaction, error: app_commands
 async def setsimonsaysrole(interaction: discord.Interaction, role: discord.Role):
     set_simonsays_role(interaction.guild_id, role.id)
     await interaction.response.send_message(f"{role.mention} can now use /simonsays.", ephemeral=True)
+
+
+@bot.tree.command(name="setsimonsayslogchannel", description="Set a channel to log every /simonsays use (who, what, where). Unset = no logging.")
+@app_commands.describe(channel="The channel to log /simonsays usage to")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def setsimonsayslogchannel(interaction: discord.Interaction, channel: discord.TextChannel):
+    set_simonsays_log_channel(interaction.guild_id, channel.id)
+    await interaction.response.send_message(f"/simonsays usage will now be logged to {channel.mention}.", ephemeral=True)
 
 
 # ---------- /report slash command (no specific message required) ----------
@@ -1009,6 +1295,14 @@ async def setreportchannel(interaction: discord.Interaction, channel: discord.Te
 async def setoncallrole(interaction: discord.Interaction, role: discord.Role):
     set_oncall_role(interaction.guild_id, role.id)
     await interaction.response.send_message(f"Escalations will now ping {role.mention}.", ephemeral=True)
+
+
+@bot.tree.command(name="setnoquoterole", description="Members with this role are exempt from having their messages saved via the 💬 quote reaction.")
+@app_commands.describe(role="The role whose members' messages can't be quoted")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def setnoquoterole(interaction: discord.Interaction, role: discord.Role):
+    set_no_quote_role(interaction.guild_id, role.id)
+    await interaction.response.send_message(f"Messages from {role.mention} can no longer be saved as quotes.", ephemeral=True)
 
 
 @bot.tree.command(name="setpinrequestchannel", description="Set a separate channel for 📌 pin requests (defaults to the report channel if unset).")
@@ -1311,6 +1605,257 @@ async def purgereports(interaction: discord.Interaction, older_than_days: int):
     )
 
 
+# ---------- quote commands ----------
+
+QUOTES_PER_PAGE = 10
+
+
+def resolve_quote(guild_id: int, number: int = None, author_id: int = None):
+    """Looks up one quote. Returns (row, error_message) — exactly one is None."""
+    if number is not None:
+        row = get_quote(guild_id, number)
+        if row is not None:
+            return row, None
+        rows = get_quotes(guild_id)
+        if not rows:
+            return None, "No quotes saved yet — react to a message with 💬 to save one."
+        highest = max(r["quote_number"] for r in rows)
+        return None, f"There's no quote #{number} here. Saved quotes go up to #{highest}."
+
+    row = get_random_quote(guild_id, author_id)
+    if row is None:
+        if author_id is not None:
+            return None, "That user doesn't have any saved quotes yet."
+        return None, "No quotes saved yet — react to a message with 💬 to save one."
+    return row, None
+
+
+def format_quote_line(row) -> str:
+    text = (row["content"] or "").replace("\n", " ").strip() or "*[no text content]*"
+    if len(text) > 70:
+        text = text[:69] + "…"
+    author = f"<@{row['author_id']}>" if row["author_id"] else (row["author_name"] or "Unknown")
+    return f"**{row['quote_number']}** — {text} — {author}"
+
+
+class QuoteListView(discord.ui.View):
+    """Paginated quote index. Only the person who ran the command can page it."""
+
+    def __init__(self, rows, requester_id: int, title: str):
+        super().__init__(timeout=180)
+        self.rows = rows
+        self.requester_id = requester_id
+        self.title = title
+        self.page = 0
+        self.page_count = max(1, (len(rows) + QUOTES_PER_PAGE - 1) // QUOTES_PER_PAGE)
+        self._sync_buttons()
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message(
+                "Only the person who ran the command can page through this. Run it yourself to browse.",
+                ephemeral=True,
+            )
+            return False
+        return True
+
+    def _sync_buttons(self):
+        self.previous_page.disabled = self.page <= 0
+        self.next_page.disabled = self.page >= self.page_count - 1
+
+    def build_embed(self) -> discord.Embed:
+        chunk = self.rows[self.page * QUOTES_PER_PAGE : (self.page + 1) * QUOTES_PER_PAGE]
+        embed = discord.Embed(
+            title=self.title,
+            description="\n".join(format_quote_line(r) for r in chunk) or "No quotes yet.",
+            color=discord.Color.blurple(),
+        )
+        embed.set_footer(
+            text=f"Page {self.page + 1}/{self.page_count} · {len(self.rows)} quote(s) · use .q <number> to read one"
+        )
+        return embed
+
+    @discord.ui.button(label="◀", style=discord.ButtonStyle.secondary)
+    async def previous_page(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.page = max(0, self.page - 1)
+        self._sync_buttons()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    @discord.ui.button(label="▶", style=discord.ButtonStyle.secondary)
+    async def next_page(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.page = min(self.page_count - 1, self.page + 1)
+        self._sync_buttons()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+
+@bot.command(name="q", aliases=["quote"])
+async def quote_prefix(ctx: commands.Context, *, target: str = None):
+    """.q -> random quote | .q 12 -> quote #12 | .q <username> -> list quotes by them |
+    .q me -> list your own | .q list -> browse all | .q s <keyword> -> search quote text"""
+    if ctx.guild is None:
+        await ctx.send("Quotes only work inside a server.")
+        return
+
+    target = (target or "").strip()
+
+    if target.lower() in ("list", "all"):
+        rows = get_quotes(ctx.guild.id)
+        if not rows:
+            await ctx.send("No quotes saved yet — react to a message with 💬 to save one.")
+            return
+        view = QuoteListView(rows, ctx.author.id, f"Quotes in {ctx.guild.name}")
+        await ctx.send(embed=view.build_embed(), view=view)
+        return
+
+    if target.lower() == "me":
+        rows = get_quotes(ctx.guild.id, ctx.author.id)
+        if not rows:
+            await ctx.send("You don't have any saved quotes yet.")
+            return
+        view = QuoteListView(rows, ctx.author.id, f"Quotes from {ctx.author.display_name}")
+        await ctx.send(embed=view.build_embed(), view=view)
+        return
+
+    parts = target.split(None, 1)
+    if parts and parts[0].lower() == "s":
+        keyword = parts[1].strip() if len(parts) > 1 else ""
+        if not keyword:
+            await ctx.send("Give me something to search for, e.g. `.q s pizza`.")
+            return
+        rows = search_quotes(ctx.guild.id, keyword)
+        if not rows:
+            await ctx.send(f"No quotes found matching **{keyword}**.")
+            return
+        view = QuoteListView(rows, ctx.author.id, f'Quotes matching "{keyword}"')
+        await ctx.send(embed=view.build_embed(), view=view)
+        return
+
+    if not target:
+        row, error = resolve_quote(ctx.guild.id)
+        if row is None:
+            await ctx.send(error)
+            return
+        await ctx.send(embed=build_quote_embed(row))
+        return
+
+    cleaned = target.lstrip("#")
+    if cleaned.isdigit():
+        row, error = resolve_quote(ctx.guild.id, number=int(cleaned))
+        if row is None:
+            await ctx.send(error)
+            return
+        await ctx.send(embed=build_quote_embed(row))
+        return
+
+    try:
+        member = await commands.MemberConverter().convert(ctx, target)
+    except commands.BadArgument:
+        await ctx.send("Use `.q`, `.q <number>`, `.q <username>`, `.q list`, or `.q s <keyword>`.")
+        return
+
+    rows = get_quotes(ctx.guild.id, member.id)
+    if not rows:
+        await ctx.send(f"No quotes saved for {member.display_name} yet.")
+        return
+    view = QuoteListView(rows, ctx.author.id, f"Quotes from {member.display_name}")
+    await ctx.send(embed=view.build_embed(), view=view)
+
+
+@bot.tree.command(name="quote", description="Show a saved quote — by number, at random, or at random from one user.")
+@app_commands.describe(number="Quote number, e.g. 12", user="Pick a random quote from this user instead")
+async def quote_slash(interaction: discord.Interaction, number: int = None, user: discord.Member = None):
+    row, error = resolve_quote(interaction.guild_id, number, user.id if user else None)
+    if row is None:
+        await interaction.response.send_message(error, ephemeral=True)
+        return
+    await interaction.response.send_message(embed=build_quote_embed(row))
+
+
+@bot.tree.command(name="quotes", description="Browse every quote saved in this server.")
+@app_commands.describe(user="Only show quotes from this user")
+async def quotes_list(interaction: discord.Interaction, user: discord.Member = None):
+    rows = get_quotes(interaction.guild_id, user.id if user else None)
+    if not rows:
+        await interaction.response.send_message(
+            f"No quotes saved for {user.display_name} yet." if user
+            else "No quotes saved yet — react to a message with 💬 to save one.",
+            ephemeral=True,
+        )
+        return
+    title = f"Quotes from {user.display_name}" if user else f"Quotes in {interaction.guild.name}"
+    view = QuoteListView(rows, interaction.user.id, title)
+    await interaction.response.send_message(embed=view.build_embed(), view=view)
+
+
+@bot.tree.command(name="delquote", description="Delete a saved quote by its number.")
+@app_commands.describe(number="The quote number to delete")
+@app_commands.checks.has_permissions(manage_messages=True)
+async def delquote(interaction: discord.Interaction, number: int):
+    if delete_quote(interaction.guild_id, number):
+        await interaction.response.send_message(f"Deleted quote #{number}.", ephemeral=True)
+    else:
+        await interaction.response.send_message(f"There's no quote #{number} in this server.", ephemeral=True)
+
+
+class ConfirmDefragQuotesView(discord.ui.View):
+    def __init__(self, guild_id: int, requester_id: int):
+        super().__init__(timeout=30)
+        self.guild_id = guild_id
+        self.requester_id = requester_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message("Only the person who ran the command can confirm this.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Yes, renumber", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        changed = renumber_quotes(self.guild_id)
+        for item in self.children:
+            item.disabled = True
+        await interaction.edit_original_response(
+            content=f"Done — quotes are now numbered 1..N with no gaps ({changed} quote(s) got a new number).",
+            view=self,
+        )
+        self.stop()
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(content="Cancelled — numbering left as-is.", view=self)
+        self.stop()
+
+
+@bot.tree.command(name="defragquotes", description="Renumber quotes to close gaps (e.g. after deletions), so numbers run 1..N with no gaps.")
+@app_commands.checks.has_permissions(manage_messages=True)
+async def defragquotes(interaction: discord.Interaction):
+    rows = get_quotes(interaction.guild_id)
+    if not rows:
+        await interaction.response.send_message("No quotes saved yet — nothing to renumber.", ephemeral=True)
+        return
+    await interaction.response.send_message(
+        f"This will renumber all {len(rows)} quote(s) in this server to run 1..N with no gaps, preserving their "
+        f"current order. Existing `.q <number>` references will point to different quotes afterward. Continue?",
+        view=ConfirmDefragQuotesView(interaction.guild_id, interaction.user.id),
+        ephemeral=True,
+    )
+
+
+@bot.event
+async def on_command_error(ctx: commands.Context, error: commands.CommandError):
+    # "." is a command prefix, so plenty of ordinary messages ("...", ".hmm")
+    # look like commands. Stay quiet on those instead of logging noise.
+    if isinstance(error, (commands.CommandNotFound, commands.CheckFailure)):
+        return
+    if isinstance(error, commands.BadArgument):
+        await ctx.send("I didn't understand that — try `.q <number>`.")
+        return
+    raise error
+
+
 async def _permission_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
     if isinstance(error, app_commands.MissingPermissions):
         await interaction.response.send_message("You don't have permission to do that.", ephemeral=True)
@@ -1323,24 +1868,27 @@ purgechannel.error(_permission_error)
 clearreports.error(_permission_error)
 setreportchannel.error(_permission_error)
 setoncallrole.error(_permission_error)
+setnoquoterole.error(_permission_error)
 setpinrequestchannel.error(_permission_error)
 setdmchannel.error(_permission_error)
 setsimonsaysrole.error(_permission_error)
+setsimonsayslogchannel.error(_permission_error)
 reports_lookup.error(_permission_error)
 dm_user.error(_permission_error)
 dm_reply.error(_permission_error)
+delquote.error(_permission_error)
+defragquotes.error(_permission_error)
 
 
-# ---------- pin request via 📌 reaction ----------
+# ---------- reaction triggers: 📌 pin request, 💬 save quote ----------
 
 PIN_EMOJI = "📌"
+QUOTE_EMOJIS = ("💬", "🗨️", "🗯️")
 
 
 @bot.event
 async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
     if payload.guild_id is None:  # ignore DMs
-        return
-    if str(payload.emoji) != PIN_EMOJI:
         return
     if payload.member is not None and payload.member.bot:
         return
@@ -1349,6 +1897,66 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
     if guild is None:
         return
 
+    emoji = str(payload.emoji)
+    if emoji == PIN_EMOJI:
+        await handle_pin_request(payload, guild)
+    elif emoji in QUOTE_EMOJIS:
+        await handle_quote_save(payload, guild)
+
+
+async def handle_quote_save(payload: discord.RawReactionActionEvent, guild: discord.Guild):
+    try:
+        channel = guild.get_channel(payload.channel_id) or await guild.fetch_channel(payload.channel_id)
+        message = await channel.fetch_message(payload.message_id)
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+        return
+
+    no_quote_role_id = no_quote_role_id_for(payload.guild_id)
+    if no_quote_role_id is not None:
+        author_member = message.author if isinstance(message.author, discord.Member) else guild.get_member(message.author.id)
+        if author_member is not None and any(role.id == no_quote_role_id for role in author_member.roles):
+            return  # this author is exempt from being quoted
+
+    image_url = None
+    for attachment in message.attachments:
+        if attachment.content_type and attachment.content_type.startswith("image/"):
+            image_url = attachment.url
+            break
+
+    content = message.content or ""
+    if message.attachments and not content:
+        content = f"*[{len(message.attachments)} attachment(s)]*"
+
+    quote_number, created = create_quote(
+        guild_id=payload.guild_id,
+        message_id=payload.message_id,
+        channel_id=payload.channel_id,
+        author_id=message.author.id,
+        author_name=message.author.display_name,
+        content=content,
+        image_url=image_url,
+        jump_url=message.jump_url,
+        saved_by_id=payload.user_id,
+        message_created_at=message.created_at.isoformat(),
+        created_at=datetime.now(timezone.utc).isoformat(),
+    )
+    if quote_number is None:
+        return  # couldn't allocate a number; nothing useful to say
+
+    saver = payload.member or guild.get_member(payload.user_id)
+    saver_name = saver.display_name if saver else "someone"
+    note = (
+        f"💬 Saved as **quote #{quote_number}** by {saver_name} — recall it with `.q {quote_number}`"
+        if created
+        else f"💬 That's already **quote #{quote_number}** — recall it with `.q {quote_number}`"
+    )
+    try:
+        await channel.send(note, reference=message, mention_author=False)
+    except (discord.Forbidden, discord.HTTPException):
+        pass  # the quote is saved either way; the confirmation is a nicety
+
+
+async def handle_pin_request(payload: discord.RawReactionActionEvent, guild: discord.Guild):
     report_channel = pin_request_channel_for(payload.guild_id)
     if report_channel is None:
         return  # no report/pin-request channel configured for this server yet
@@ -1400,7 +2008,8 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
 async def on_message(message: discord.Message):
     if message.author.bot:
         return
-    if message.guild is not None:  # only care about DMs here
+    if message.guild is not None:  # everything past this point only handles DMs
+        await maybe_reply_good_bot(message)
         await bot.process_commands(message)
         return
 
@@ -1413,7 +2022,6 @@ async def on_message(message: discord.Message):
     if message.attachments:
         content += f" ({len(message.attachments)} attachment(s): " + ", ".join(a.url for a in message.attachments) + ")"
 
-    relayed = False
     for row in threads:
         guild = bot.get_guild(row["guild_id"])
         if guild is None:
@@ -1426,15 +2034,8 @@ async def on_message(message: discord.Message):
                 continue
         try:
             await thread.send(f"↩️ **{message.author}** replied: {content}")
-            relayed = True
         except (discord.Forbidden, discord.HTTPException):
             continue
-
-    if relayed:
-        try:
-            await message.add_reaction("✅")
-        except (discord.Forbidden, discord.HTTPException):
-            pass
 
     await bot.process_commands(message)
 
