@@ -34,6 +34,29 @@ To add poohbot to your server: [Click this link](https://discord.com/oauth2/auth
   message) and **Deny** buttons — open to anyone who can see that channel.
   Each message can only ever generate one pin request.
 
+**Quote board**
+- React 💬 (also 🗨️ or 🗯️) on any message to save it as a numbered quote —
+  no setup required, no approval needed, works instantly in any channel the
+  bot can read.
+- Recall one with `.q <number>` or `/quote number:`. `.q` with nothing after
+  it grabs a random quote; `.q @user` / `.q <username>` lists everything from
+  one person; `.q me` lists your own; `.q list` (or `/quotes`) browses
+  everything, paginated; `.q s <keyword>` (or `/quotes`) searches quote text.
+- Quotes render in the classic UB3R-B0T style: `#<number>`, the quote text, a
+  bullet with the author mention and a jump link, and a plain footer with the
+  original message's timestamp.
+- `/delquote number:` removes one (Manage Messages). `/defragquotes`
+  renumbers everything to close gaps left by deletions, behind a
+  confirmation prompt.
+- `/setnoquoterole` exempts a role's members from ever being quoted — 💬
+  reactions on their messages are silently ignored.
+- `import_quotes.py` (run separately, not a bot command) bulk-imports a
+  `quotes.json` export from another quote bot into `reportbot.db`.
+
+**Fun extras**
+- Say "good bot" (any casing/punctuation) in a channel the bot can see and
+  it replies "no u" — once per channel per 5 minutes.
+
 **Moderator DMs**
 - `/dm` sends a message to a user on the moderation team's behalf, creating a
   dedicated conversation thread per user. The user's DM replies are relayed
@@ -71,6 +94,12 @@ To add poohbot to your server: [Click this link](https://discord.com/oauth2/auth
 | `/setsimonsaysrole` | Manage Server | Grant a role access to `/simonsays` |
 | `/simonsays` | Admin or configured role | Make the bot say something |
 | `/setstatus` | Bot owner | Change the bot's Discord status |
+| `.q` / `.q <number>` / `.q @user` / `.q me` | Anyone | Recall a quote (random / by number / by author / your own) |
+| `.q list` / `.q s <keyword>` | Anyone | Browse or search saved quotes |
+| `/quote`, `/quotes` | Anyone | Slash equivalents of `.q` and `.q list`/`.q s` |
+| `/delquote` | Manage Messages | Delete a quote by number |
+| `/defragquotes` | Manage Messages | Renumber quotes to close gaps (confirms first) |
+| `/setnoquoterole` | Manage Server | Exempt a role's members from being quoted |
 
 Channel settings (`setpinrequestchannel`, `setdmchannel`) fall back to the
 main report channel if left unset.
@@ -87,8 +116,11 @@ main report channel if left unset.
    [Discord Developer Portal](https://discord.com/developers/applications).
    - Invite it with the `bot` and `applications.commands` scopes.
    - Grant these permissions: **View Channels, Send Messages, Embed Links,
-     Manage Messages, Moderate Members, Manage Threads, Create Public
-     Threads**.
+     Read Message History, Manage Messages, Moderate Members, Manage
+     Threads, Create Public Threads**.
+   - On the Bot page, turn on **Message Content Intent** — required for the
+     `.q` and "good bot" text commands to see message content. Everything
+     else (slash commands, reactions) works without it.
 
 3. **Set environment variables:**
    ```bash
@@ -117,7 +149,13 @@ restarts automatically and survives reboots.
 Everything is stored in a single SQLite file, `reportbot.db`, created
 automatically on first run in the working directory. No manual migration
 steps are needed when pulling updates — the bot adds any new columns/tables
-it needs on startup.
+it needs on startup. This includes the `quotes` table used by the quote
+board.
+
+Migrating from another quote bot? `python3 import_quotes.py quotes.json`
+bulk-loads a JSON export into `reportbot.db`, preserving original quote
+numbers and skipping anything already imported — see the script's docstring
+for options.
 
 ## Notes
 
@@ -130,3 +168,5 @@ it needs on startup.
 - New slash commands can take up to ~1 hour to appear after a restart
   (global sync). Set `TEST_GUILD_ID` for instant sync to one server while
   developing.
+- Text commands (`.q`, and the `!` alt prefix) are case-insensitive —
+  `.Q`, `.QUOTE`, etc. all work the same as `.q`.

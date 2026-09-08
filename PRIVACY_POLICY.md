@@ -1,6 +1,6 @@
 # Privacy Policy
 
-**Last updated: 6 September 2026**
+**Last updated: 8 September 2026**
 
 This Privacy Policy explains what data **PoohBot** (the "Bot") collects,
 how it is used, and how it is stored. The Bot is operated by **Poohstrnak** ("we," "us," or "our"). By adding the Bot to a Discord
@@ -17,12 +17,14 @@ server(s) that run it:
 | Report cases | A message/user is reported | Reported message content, reporter's user ID, reported user's ID, channel/message IDs, reason text, timestamps, moderator who resolved it |
 | Warnings | A moderator issues a warning | Warned user's ID, moderator's ID, reason text, timestamp |
 | Pin requests | A user reacts 📌 to a message | Requesting user's ID, message and channel IDs, approval/denial status |
+| Quotes | A user reacts 💬 to a message | Quoted message's content and any image attachment, the author's ID, channel/message IDs, the ID of the user who saved it, timestamps |
 | Moderator DMs | A moderator uses the DM feature | Message content sent to and received from the user, associated Discord IDs |
 | Server configuration | An admin runs a setup command | Configured channel IDs, role IDs, and bot status preferences |
 
 We do **not** collect data outside of these features — for example, the Bot
 does not log ordinary messages that are never reported, reacted to with a
-pin request, or otherwise passed through one of the features above.
+pin request or quote reaction, or otherwise passed through one of the
+features above.
 
 ## 2. How We Use This Data
 
