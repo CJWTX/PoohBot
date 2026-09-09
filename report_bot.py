@@ -1648,6 +1648,7 @@ class QuoteListView(discord.ui.View):
         self.title = title
         self.page = 0
         self.page_count = max(1, (len(rows) + QUOTES_PER_PAGE - 1) // QUOTES_PER_PAGE)
+        self.message: discord.Message = None  # set by the caller right after sending
         self._sync_buttons()
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
@@ -1658,6 +1659,15 @@ class QuoteListView(discord.ui.View):
             )
             return False
         return True
+
+    async def on_timeout(self):
+        for item in self.children:
+            item.disabled = True
+        if self.message is not None:
+            try:
+                await self.message.edit(view=self)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                pass
 
     def _sync_buttons(self):
         self.previous_page.disabled = self.page <= 0
@@ -1704,7 +1714,7 @@ async def quote_prefix(ctx: commands.Context, *, target: str = None):
             await ctx.send("No quotes saved yet — react to a message with 💬 to save one.")
             return
         view = QuoteListView(rows, ctx.author.id, f"Quotes in {ctx.guild.name}")
-        await ctx.send(embed=view.build_embed(), view=view)
+        view.message = await ctx.send(embed=view.build_embed(), view=view)
         return
 
     if target.lower() == "me":
@@ -1713,7 +1723,7 @@ async def quote_prefix(ctx: commands.Context, *, target: str = None):
             await ctx.send("You don't have any saved quotes yet.")
             return
         view = QuoteListView(rows, ctx.author.id, f"Quotes from {ctx.author.display_name}")
-        await ctx.send(embed=view.build_embed(), view=view)
+        view.message = await ctx.send(embed=view.build_embed(), view=view)
         return
 
     parts = target.split(None, 1)
@@ -1727,7 +1737,7 @@ async def quote_prefix(ctx: commands.Context, *, target: str = None):
             await ctx.send(f"No quotes found matching **{keyword}**.")
             return
         view = QuoteListView(rows, ctx.author.id, f'Quotes matching "{keyword}"')
-        await ctx.send(embed=view.build_embed(), view=view)
+        view.message = await ctx.send(embed=view.build_embed(), view=view)
         return
 
     if not target:
@@ -1758,7 +1768,7 @@ async def quote_prefix(ctx: commands.Context, *, target: str = None):
         await ctx.send(f"No quotes saved for {member.display_name} yet.")
         return
     view = QuoteListView(rows, ctx.author.id, f"Quotes from {member.display_name}")
-    await ctx.send(embed=view.build_embed(), view=view)
+    view.message = await ctx.send(embed=view.build_embed(), view=view)
 
 
 @bot.tree.command(name="quote", description="Show a saved quote — by number, at random, or at random from one user.")
@@ -1785,6 +1795,7 @@ async def quotes_list(interaction: discord.Interaction, user: discord.Member = N
     title = f"Quotes from {user.display_name}" if user else f"Quotes in {interaction.guild.name}"
     view = QuoteListView(rows, interaction.user.id, title)
     await interaction.response.send_message(embed=view.build_embed(), view=view)
+    view.message = await interaction.original_response()
 
 
 @bot.tree.command(name="delquote", description="Delete a saved quote by its number.")
