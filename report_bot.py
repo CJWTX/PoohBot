@@ -1702,12 +1702,27 @@ class QuoteListView(discord.ui.View):
 async def quote_prefix(ctx: commands.Context, *, target: str = None):
     """.q -> random quote | .q 12 -> quote #12 | .q <username> -> list quotes by them |
     .q me -> list your own | .q list -> browse all | .q s <keyword> -> search quote text |
-    .q delete <number> -> delete a quote you added (or any, with Manage Messages)"""
+    .q delete <number> -> delete a quote you added (or any, with Manage Messages) |
+    .q help -> list what everyone can do"""
     if ctx.guild is None:
         await ctx.send("Quotes only work inside a server.")
         return
 
     target = (target or "").strip()
+
+    if target.lower() == "help":
+        await ctx.send(
+            "**Quote board commands (anyone can use these):**\n"
+            "`.q` — show a random quote\n"
+            "`.q <number>` — show quote #<number>\n"
+            "`.q @user` / `.q <username>` — list quotes from someone\n"
+            "`.q me` — list your own quotes\n"
+            "`.q list` — browse every quote, paginated\n"
+            "`.q s <keyword>` — search quote text\n"
+            "`.q delete <number>` — delete a quote you added yourself\n"
+            "React 💬 (or 🗨️ / 🗯️) on any message to save it as a new quote."
+        )
+        return
 
     if target.lower() in ("list", "all"):
         rows = get_quotes(ctx.guild.id)
