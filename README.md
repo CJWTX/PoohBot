@@ -45,8 +45,9 @@ To add poohbot to your server: [Click this link](https://discord.com/oauth2/auth
 - `.q delete <number>` lets you remove a quote you added yourself (matched
   against who triggered the 💬 save, not who was quoted); anyone with Manage
   Messages can delete any quote this way too.
-- `.q help` lists everything in this section that's open to anyone — it
-  leaves out mod-only stuff like `/delquote` and `/defragquotes`.
+- `.q help` lists everything in this section that's open to anyone, including
+  the 📌 pin-request reaction — it leaves out mod-only stuff like `/delquote`
+  and `/defragquotes`.
 - Quotes render in the classic UB3R-B0T style: `#<number>`, the quote text, a
   bullet with the author mention and a jump link, and a plain footer with the
   original message's timestamp.

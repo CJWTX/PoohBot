@@ -1720,7 +1720,8 @@ async def quote_prefix(ctx: commands.Context, *, target: str = None):
             "`.q list` — browse every quote, paginated\n"
             "`.q s <keyword>` — search quote text\n"
             "`.q delete <number>` — delete a quote you added yourself\n"
-            "React 💬 (or 🗨️ / 🗯️) on any message to save it as a new quote."
+            "React 💬 (or 🗨️ / 🗯️) on any message to save it as a new quote.\n"
+            "React 📌 on any message to request that it be pinned."
         )
         return
 
