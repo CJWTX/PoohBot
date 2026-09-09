@@ -47,7 +47,7 @@ To add poohbot to your server: [Click this link](https://discord.com/oauth2/auth
   Messages can delete any quote this way too.
 - `.q help` lists everything in this section that's open to anyone, including
   the 📌 pin-request reaction — it leaves out mod-only stuff like `/delquote`
-  and `/defragquotes`.
+  and `/defragquotes`. Limited to once per 5 minutes per user.
 - Quotes render in the classic UB3R-B0T style: `#<number>`, the quote text, a
   bullet with the author mention and a jump link, and a plain footer with the
   original message's timestamp.
@@ -105,7 +105,7 @@ To add poohbot to your server: [Click this link](https://discord.com/oauth2/auth
 | `.q` / `.q <number>` / `.q @user` / `.q me` | Anyone | Recall a quote (random / by number / by author / your own) |
 | `.q list` / `.q s <keyword>` | Anyone | Browse or search saved quotes |
 | `.q delete <number>` | Quote's adder, or Manage Messages | Delete a quote by number |
-| `.q help` | Anyone | List the quote commands everyone can use |
+| `.q help` | Anyone | List the quote commands everyone can use (5m per-user cooldown) |
 | `/quote`, `/quotes` | Anyone | Slash equivalents of `.q` and `.q list`/`.q s` |
 | `/delquote` | Manage Messages | Delete a quote by number |
 | `/defragquotes` | Manage Messages | Renumber quotes to close gaps (confirms first) |
