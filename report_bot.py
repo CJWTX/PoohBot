@@ -1698,6 +1698,9 @@ class QuoteListView(discord.ui.View):
         await interaction.response.edit_message(embed=self.build_embed(), view=self)
 
 
+q_help_cooldown = commands.CooldownMapping.from_cooldown(1, 300, commands.BucketType.user)
+
+
 @bot.command(name="q", aliases=["quote"])
 async def quote_prefix(ctx: commands.Context, *, target: str = None):
     """.q -> random quote | .q 12 -> quote #12 | .q <username> -> list quotes by them |
@@ -1711,6 +1714,10 @@ async def quote_prefix(ctx: commands.Context, *, target: str = None):
     target = (target or "").strip()
 
     if target.lower() == "help":
+        retry_after = q_help_cooldown.update_rate_limit(ctx.message)
+        if retry_after:
+            await ctx.send(f"`.q help` is on cooldown — try again in {retry_after:.0f}s.")
+            return
         await ctx.send(
             "**Quote board commands (anyone can use these):**\n"
             "`.q` — show a random quote\n"
