@@ -1998,7 +1998,7 @@ async def handle_quote_save(payload: discord.RawReactionActionEvent, guild: disc
     saver = payload.member or guild.get_member(payload.user_id)
     saver_name = saver.display_name if saver else "someone"
     note = (
-        f"New quote added by {saver_name} as #{quote_number}\n{message.jump_url}"
+        f"New quote added by {saver_name} as #{quote_number} {message.jump_url}"
         if created
         else f"💬 That's already **quote #{quote_number}** — recall it with `.q {quote_number}`\n{message.jump_url}"
     )
