@@ -1964,6 +1964,27 @@ async def foxxo(interaction: discord.Interaction):
     await _send_klipy_gif(interaction, "fox")
 
 
+FU_ASCII = r"""
+    _
+   | |
+   | |
+   | |
+ __| |__
+ \       /
+  \     /
+   \   /
+    | |
+    | |
+    | |
+    |_|
+"""
+
+
+@bot.tree.command(name="fu", description="Draw a middle finger in ASCII art.")
+async def fu(interaction: discord.Interaction):
+    await interaction.response.send_message(f"```{FU_ASCII}```")
+
+
 @bot.event
 async def on_command_error(ctx: commands.Context, error: commands.CommandError):
     # "." is a command prefix, so plenty of ordinary messages ("...", ".hmm")
