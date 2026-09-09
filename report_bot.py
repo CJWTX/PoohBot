@@ -1701,7 +1701,8 @@ class QuoteListView(discord.ui.View):
 @bot.command(name="q", aliases=["quote"])
 async def quote_prefix(ctx: commands.Context, *, target: str = None):
     """.q -> random quote | .q 12 -> quote #12 | .q <username> -> list quotes by them |
-    .q me -> list your own | .q list -> browse all | .q s <keyword> -> search quote text"""
+    .q me -> list your own | .q list -> browse all | .q s <keyword> -> search quote text |
+    .q delete <number> -> delete a quote you added (or any, with Manage Messages)"""
     if ctx.guild is None:
         await ctx.send("Quotes only work inside a server.")
         return
@@ -1738,6 +1739,23 @@ async def quote_prefix(ctx: commands.Context, *, target: str = None):
             return
         view = QuoteListView(rows, ctx.author.id, f'Quotes matching "{keyword}"')
         view.message = await ctx.send(embed=view.build_embed(), view=view)
+        return
+
+    if parts and parts[0].lower() in ("delete", "del"):
+        number_text = parts[1].strip().lstrip("#") if len(parts) > 1 else ""
+        if not number_text.isdigit():
+            await ctx.send("Give me a quote number to delete, e.g. `.q delete 12`.")
+            return
+        number = int(number_text)
+        row = get_quote(ctx.guild.id, number)
+        if row is None:
+            await ctx.send(f"There's no quote #{number} in this server.")
+            return
+        if row["saved_by_id"] != ctx.author.id and not ctx.author.guild_permissions.manage_messages:
+            await ctx.send(f"You can only delete quotes you added yourself — quote #{number} was added by someone else.")
+            return
+        delete_quote(ctx.guild.id, number)
+        await ctx.send(f"Deleted quote #{number}.")
         return
 
     if not target:

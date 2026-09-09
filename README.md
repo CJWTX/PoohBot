@@ -42,6 +42,9 @@ To add poohbot to your server: [Click this link](https://discord.com/oauth2/auth
   it grabs a random quote; `.q @user` / `.q <username>` lists everything from
   one person; `.q me` lists your own; `.q list` (or `/quotes`) browses
   everything, paginated; `.q s <keyword>` (or `/quotes`) searches quote text.
+- `.q delete <number>` lets you remove a quote you added yourself (matched
+  against who triggered the 💬 save, not who was quoted); anyone with Manage
+  Messages can delete any quote this way too.
 - Quotes render in the classic UB3R-B0T style: `#<number>`, the quote text, a
   bullet with the author mention and a jump link, and a plain footer with the
   original message's timestamp.
@@ -98,6 +101,7 @@ To add poohbot to your server: [Click this link](https://discord.com/oauth2/auth
 | `/setstatus` | Bot owner | Change the bot's Discord status |
 | `.q` / `.q <number>` / `.q @user` / `.q me` | Anyone | Recall a quote (random / by number / by author / your own) |
 | `.q list` / `.q s <keyword>` | Anyone | Browse or search saved quotes |
+| `.q delete <number>` | Quote's adder, or Manage Messages | Delete a quote by number |
 | `/quote`, `/quotes` | Anyone | Slash equivalents of `.q` and `.q list`/`.q s` |
 | `/delquote` | Manage Messages | Delete a quote by number |
 | `/defragquotes` | Manage Messages | Renumber quotes to close gaps (confirms first) |
