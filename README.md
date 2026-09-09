@@ -72,7 +72,8 @@ To add poohbot to your server: [Click this link](https://discord.com/oauth2/auth
 - `/purgechannel` — bulk-deletes recent messages in a channel (Admin only),
   also behind a confirmation prompt.
 - `/simonsays` — makes the bot say something in the channel; usable by
-  admins or a role you configure with `/setsimonsaysrole`.
+  admins or a role you configure with `/setsimonsaysrole`. Optionally log
+  every use (who, what, where) to a channel with `/setsimonsayslogchannel`.
 - `/setstatus` — sets the bot's Discord activity status (bot owner only).
 
 ## Commands
@@ -92,6 +93,7 @@ To add poohbot to your server: [Click this link](https://discord.com/oauth2/auth
 | `/setdmchannel` | Manage Server | Set a separate channel for DM threads |
 | `/setoncallrole` | Manage Server | Set the role pinged on Escalate |
 | `/setsimonsaysrole` | Manage Server | Grant a role access to `/simonsays` |
+| `/setsimonsayslogchannel` | Manage Server | Set a channel to log `/simonsays` usage |
 | `/simonsays` | Admin or configured role | Make the bot say something |
 | `/setstatus` | Bot owner | Change the bot's Discord status |
 | `.q` / `.q <number>` / `.q @user` / `.q me` | Anyone | Recall a quote (random / by number / by author / your own) |
