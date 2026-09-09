@@ -62,6 +62,9 @@ To add poohbot to your server: [Click this link](https://discord.com/oauth2/auth
 **Fun extras**
 - Say "good bot" (any casing/punctuation) in a channel the bot can see and
   it replies "no u" — once per channel per 5 minutes.
+- `/capybara` posts a random capybara gif, pulled live from Klipy. Requires
+  a `KLIPY_API_KEY` (see Setup) — without one it replies with a setup
+  reminder instead of a gif.
 
 **Moderator DMs**
 - `/dm` sends a message to a user on the moderation team's behalf, creating a
@@ -102,6 +105,7 @@ To add poohbot to your server: [Click this link](https://discord.com/oauth2/auth
 | `/setsimonsayslogchannel` | Manage Server | Set a channel to log `/simonsays` usage |
 | `/simonsays` | Admin or configured role | Make the bot say something |
 | `/setstatus` | Bot owner | Change the bot's Discord status |
+| `/capybara` | Anyone | Post a random capybara gif (needs `KLIPY_API_KEY`) |
 | `.q` / `.q <number>` / `.q @user` / `.q me` | Anyone | Recall a quote (random / by number / by author / your own) |
 | `.q list` / `.q s <keyword>` | Anyone | Browse or search saved quotes |
 | `.q delete <number>` | Quote's adder, or Manage Messages | Delete a quote by number |
@@ -137,6 +141,9 @@ main report channel if left unset.
    export DISCORD_BOT_TOKEN="your-token-here"
    # optional, for instant command sync to one server while testing:
    export TEST_GUILD_ID="your-server-id"
+   # optional, required only for /capybara — get a free key at
+   # https://klipy.com/developers
+   export KLIPY_API_KEY="your-klipy-key"
    ```
 
 4. **Run it:**

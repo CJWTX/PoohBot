@@ -22,6 +22,7 @@ FEATURES
     then recall it with ".q 12" (or /quote), browse with /quotes,
     search text with ".q s <keyword>"
   - /setreportchannel, /setoncallrole, /setnoquoterole - per-server config
+  - /capybara - posts a random capybara gif (needs KLIPY_API_KEY)
 
 SETUP
 1. pip install -U discord.py     (sqlite3 is in the Python standard library)
@@ -35,6 +36,7 @@ SETUP
      (Everything else works without it; slash commands are unaffected.)
 3. export DISCORD_BOT_TOKEN="your-token-here"
    (optional) export TEST_GUILD_ID="your-server-id"   for instant command sync while testing
+   (optional) export KLIPY_API_KEY="your-klipy-key"   required for /capybara
 4. Run: python report_bot.py
 5. In Discord: /setreportchannel #mod-reports and /setoncallrole @Mods
    (both require Manage Server permission), then try Report Message.
@@ -50,6 +52,7 @@ import sqlite3
 import time
 from datetime import datetime, timedelta, timezone
 
+import aiohttp
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -60,6 +63,7 @@ DB_FILE = "reportbot.db"
 MAX_REPORTS_PER_WINDOW = 3
 RATE_LIMIT_WINDOW_SECONDS = 300  # 5 minutes
 MIN_ACCOUNT_AGE_DAYS = 1
+KLIPY_API_KEY = os.environ.get("KLIPY_API_KEY")
 
 # ---------- database ----------
 
@@ -1894,6 +1898,61 @@ async def defragquotes(interaction: discord.Interaction):
         view=ConfirmDefragQuotesView(interaction.guild_id, interaction.user.id),
         ephemeral=True,
     )
+
+
+@bot.tree.command(name="capybara", description="Post a random capybara gif.")
+async def capybara(interaction: discord.Interaction):
+    if not KLIPY_API_KEY:
+        await interaction.response.send_message(
+            "This command needs a Klipy API key — set the KLIPY_API_KEY environment variable and restart the bot.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer()
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"https://api.klipy.com/api/v1/{KLIPY_API_KEY}/gifs/search",
+                params={
+                    "q": "capybara",
+                    "customer_id": str(interaction.user.id),
+                    "per_page": 50,
+                    "content_filter": "high",
+                    "format_filter": "gif",
+                },
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                if resp.status != 200:
+                    await interaction.followup.send("Couldn't reach Klipy right now — try again in a bit.")
+                    return
+                data = await resp.json()
+    except (aiohttp.ClientError, TimeoutError):
+        await interaction.followup.send("Couldn't reach Klipy right now — try again in a bit.")
+        return
+
+    if not data.get("result"):
+        await interaction.followup.send("Couldn't reach Klipy right now — try again in a bit.")
+        return
+
+    results = (data.get("data") or {}).get("data") or []
+    if not results:
+        await interaction.followup.send("Couldn't find a capybara gif — try again in a bit.")
+        return
+
+    files = random.choice(results).get("file") or {}
+    gif_url = None
+    for size in ("md", "hd", "sm", "xs"):
+        variant = files.get(size, {}).get("gif")
+        if variant:
+            gif_url = variant["url"]
+            break
+
+    if not gif_url:
+        await interaction.followup.send("Couldn't find a capybara gif — try again in a bit.")
+        return
+
+    await interaction.followup.send(gif_url)
 
 
 @bot.event
