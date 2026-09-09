@@ -1900,8 +1900,7 @@ async def defragquotes(interaction: discord.Interaction):
     )
 
 
-@bot.tree.command(name="capybara", description="Post a random capybara gif.")
-async def capybara(interaction: discord.Interaction):
+async def _send_klipy_gif(interaction: discord.Interaction, query: str) -> None:
     if not KLIPY_API_KEY:
         await interaction.response.send_message(
             "This command needs a Klipy API key — set the KLIPY_API_KEY environment variable and restart the bot.",
@@ -1915,7 +1914,7 @@ async def capybara(interaction: discord.Interaction):
             async with session.get(
                 f"https://api.klipy.com/api/v1/{KLIPY_API_KEY}/gifs/search",
                 params={
-                    "q": "capybara",
+                    "q": query,
                     "customer_id": str(interaction.user.id),
                     "per_page": 50,
                     "content_filter": "high",
@@ -1937,7 +1936,7 @@ async def capybara(interaction: discord.Interaction):
 
     results = (data.get("data") or {}).get("data") or []
     if not results:
-        await interaction.followup.send("Couldn't find a capybara gif — try again in a bit.")
+        await interaction.followup.send(f"Couldn't find a {query} gif — try again in a bit.")
         return
 
     files = random.choice(results).get("file") or {}
@@ -1949,10 +1948,20 @@ async def capybara(interaction: discord.Interaction):
             break
 
     if not gif_url:
-        await interaction.followup.send("Couldn't find a capybara gif — try again in a bit.")
+        await interaction.followup.send(f"Couldn't find a {query} gif — try again in a bit.")
         return
 
     await interaction.followup.send(gif_url)
+
+
+@bot.tree.command(name="capybara", description="Post a random capybara gif.")
+async def capybara(interaction: discord.Interaction):
+    await _send_klipy_gif(interaction, "capybara")
+
+
+@bot.tree.command(name="foxxo", description="Post a random fox gif.")
+async def foxxo(interaction: discord.Interaction):
+    await _send_klipy_gif(interaction, "fox")
 
 
 @bot.event

@@ -65,6 +65,7 @@ To add poohbot to your server: [Click this link](https://discord.com/oauth2/auth
 - `/capybara` posts a random capybara gif, pulled live from Klipy. Requires
   a `KLIPY_API_KEY` (see Setup) — without one it replies with a setup
   reminder instead of a gif.
+- `/foxxo` posts a random fox gif, same Klipy setup as `/capybara`.
 
 **Moderator DMs**
 - `/dm` sends a message to a user on the moderation team's behalf, creating a
@@ -106,6 +107,7 @@ To add poohbot to your server: [Click this link](https://discord.com/oauth2/auth
 | `/simonsays` | Admin or configured role | Make the bot say something |
 | `/setstatus` | Bot owner | Change the bot's Discord status |
 | `/capybara` | Anyone | Post a random capybara gif (needs `KLIPY_API_KEY`) |
+| `/foxxo` | Anyone | Post a random fox gif (needs `KLIPY_API_KEY`) |
 | `.q` / `.q <number>` / `.q @user` / `.q me` | Anyone | Recall a quote (random / by number / by author / your own) |
 | `.q list` / `.q s <keyword>` | Anyone | Browse or search saved quotes |
 | `.q delete <number>` | Quote's adder, or Manage Messages | Delete a quote by number |
