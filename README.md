@@ -1,6 +1,6 @@
-# Discord Report Bot
+# Poohbot
 
-A moderation bot for Discord that gives your community a proper reporting
+A moderation (and other complely random uses) bot for Discord that gives your community a proper reporting
 pipeline: users flag messages or situations, mods get a tracked case with
 one-click actions, and a handful of related moderation tools (pin requests,
 mod-to-user DMs, bulk cleanup) live alongside it.
