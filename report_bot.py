@@ -163,6 +163,18 @@ def init_db():
     conn.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_quotes_guild_message ON quotes (guild_id, message_id)"
     )
+    # Webhook-posted messages (e.g. bots that post with a custom name/avatar
+    # per message) never carry Discord member/role data, so no_quote_role_id
+    # can't exempt them — this table exempts specific webhooks by id instead.
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS no_quote_webhooks (
+            guild_id INTEGER,
+            webhook_id INTEGER,
+            added_by_id INTEGER,
+            created_at TEXT,
+            PRIMARY KEY (guild_id, webhook_id)
+        )"""
+    )
     conn.commit()
     conn.close()
     _migrate_add_column("guild_config", "pin_request_channel_id", "INTEGER")
@@ -306,6 +318,43 @@ def set_no_quote_role(guild_id: int, role_id: int):
     )
     conn.commit()
     conn.close()
+
+
+def add_no_quote_webhook(guild_id: int, webhook_id: int, added_by_id: int) -> bool:
+    """Exempts a webhook's messages from quote-saving. Returns True if newly
+    added, False if it was already exempt."""
+    conn = db_connect()
+    try:
+        conn.execute(
+            "INSERT INTO no_quote_webhooks (guild_id, webhook_id, added_by_id, created_at) VALUES (?, ?, ?, ?)",
+            (guild_id, webhook_id, added_by_id, datetime.now(timezone.utc).isoformat()),
+        )
+        conn.commit()
+        return True
+    except sqlite3.IntegrityError:
+        return False
+    finally:
+        conn.close()
+
+
+def remove_no_quote_webhook(guild_id: int, webhook_id: int) -> bool:
+    """Un-exempts a webhook. Returns True if a row was actually removed."""
+    conn = db_connect()
+    cur = conn.execute(
+        "DELETE FROM no_quote_webhooks WHERE guild_id = ? AND webhook_id = ?", (guild_id, webhook_id)
+    )
+    conn.commit()
+    conn.close()
+    return cur.rowcount > 0
+
+
+def is_no_quote_webhook(guild_id: int, webhook_id: int) -> bool:
+    conn = db_connect()
+    row = conn.execute(
+        "SELECT 1 FROM no_quote_webhooks WHERE guild_id = ? AND webhook_id = ?", (guild_id, webhook_id)
+    ).fetchone()
+    conn.close()
+    return row is not None
 
 
 def set_simonsays_log_channel(guild_id: int, channel_id: int):
@@ -1309,6 +1358,31 @@ async def setnoquoterole(interaction: discord.Interaction, role: discord.Role):
     await interaction.response.send_message(f"Messages from {role.mention} can no longer be saved as quotes.", ephemeral=True)
 
 
+@bot.tree.context_menu(name="Toggle No-Quote Webhook")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def toggle_no_quote_webhook(interaction: discord.Interaction, message: discord.Message):
+    """Exempts (or un-exempts) the webhook that posted this message from 💬
+    quote-saving. Needed for bots that post via webhook with a custom
+    name/avatar per message — those have no real Discord role to target with
+    /setnoquoterole."""
+    if message.webhook_id is None:
+        await interaction.response.send_message(
+            "That message wasn't posted through a webhook — use `/setnoquoterole` to exempt it by role instead.",
+            ephemeral=True,
+        )
+        return
+    if remove_no_quote_webhook(interaction.guild_id, message.webhook_id):
+        await interaction.response.send_message(
+            "That webhook's messages can be saved as quotes again.", ephemeral=True
+        )
+    else:
+        add_no_quote_webhook(interaction.guild_id, message.webhook_id, interaction.user.id)
+        await interaction.response.send_message(
+            "Messages posted through that webhook (like this one) can no longer be saved as quotes.",
+            ephemeral=True,
+        )
+
+
 @bot.tree.command(name="setpinrequestchannel", description="Set a separate channel for 📌 pin requests (defaults to the report channel if unset).")
 @app_commands.describe(channel="The channel pin requests should go to")
 @app_commands.checks.has_permissions(manage_guild=True)
@@ -2015,6 +2089,7 @@ clearreports.error(_permission_error)
 setreportchannel.error(_permission_error)
 setoncallrole.error(_permission_error)
 setnoquoterole.error(_permission_error)
+toggle_no_quote_webhook.error(_permission_error)
 setpinrequestchannel.error(_permission_error)
 setdmchannel.error(_permission_error)
 setsimonsaysrole.error(_permission_error)
@@ -2057,11 +2132,27 @@ async def handle_quote_save(payload: discord.RawReactionActionEvent, guild: disc
     except (discord.NotFound, discord.Forbidden, discord.HTTPException):
         return
 
-    no_quote_role_id = no_quote_role_id_for(payload.guild_id)
-    if no_quote_role_id is not None:
-        author_member = message.author if isinstance(message.author, discord.Member) else guild.get_member(message.author.id)
-        if author_member is not None and any(role.id == no_quote_role_id for role in author_member.roles):
-            return  # this author is exempt from being quoted
+    if message.webhook_id is not None:
+        # Webhook-posted messages (custom name/avatar per send) carry no
+        # Discord member or role data, so no_quote_role can't exempt them —
+        # check the webhook-id exemption list instead.
+        if is_no_quote_webhook(payload.guild_id, message.webhook_id):
+            return
+    else:
+        no_quote_role_id = no_quote_role_id_for(payload.guild_id)
+        if no_quote_role_id is not None:
+            author_member = message.author if isinstance(message.author, discord.Member) else None
+            if author_member is None:
+                # The REST message-fetch endpoint often omits member data (no
+                # roles), and without the privileged members intent the local
+                # cache can't be trusted either — fetch the member directly
+                # so the exemption isn't silently skipped.
+                try:
+                    author_member = await guild.fetch_member(message.author.id)
+                except (discord.NotFound, discord.HTTPException):
+                    author_member = None
+            if author_member is not None and any(role.id == no_quote_role_id for role in author_member.roles):
+                return  # this author is exempt from being quoted
 
     image_url = None
     for attachment in message.attachments:
