@@ -83,6 +83,8 @@ To add poohbot to your server: [Click this link](https://discord.com/oauth2/auth
   speed/direction, plus today's high/low and chance of precipitation — all
   temperatures shown in both °F and °C. Geocoding and forecasts come from
   Open-Meteo; no API key needed.
+- `.w <location>` (a city or US ZIP) checks the forecast for any place
+  one-off, without touching your saved location.
 - `/clearlocation` deletes your saved location. It's tied to you rather than
   a server, so this is self-service — no mod involvement needed.
 
@@ -130,6 +132,7 @@ To add poohbot to your server: [Click this link](https://discord.com/oauth2/auth
 | `/fu` | Anyone | Draw a middle finger in ASCII art |
 | `/setlocation` | Anyone | Save your location (city or US ZIP) for `.w` |
 | `.w` / `.weather` | Anyone | Show today's forecast for your saved location |
+| `.w <location>` | Anyone | Show today's forecast for any city/ZIP, one-off |
 | `/clearlocation` | Anyone (self only) | Delete your own saved location |
 | `.q` / `.q <number>` / `.q @user` / `.q me` | Anyone | Recall a quote (random / by number / by author / your own) |
 | `.q list` / `.q s <keyword>` | Anyone | Browse or search saved quotes |

@@ -24,8 +24,9 @@ FEATURES
   - /setreportchannel, /setoncallrole, /setnoquoterole - per-server config
   - /capybara - posts a random capybara gif (needs KLIPY_API_KEY)
   - /setlocation + ".w" - set your location once (city name or 5-digit US
-    ZIP), then ".w" shows today's forecast for it (Open-Meteo, no API key
-    needed)
+    ZIP), then ".w" shows today's forecast for it; ".w <location>" checks
+    any place one-off without changing what's saved (Open-Meteo, no API
+    key needed)
 
 SETUP
 1. pip install -U discord.py     (sqlite3 is in the Python standard library)
@@ -2303,19 +2304,34 @@ async def clearlocation(interaction: discord.Interaction):
 
 
 @bot.command(name="w", aliases=["weather"])
-async def weather_prefix(ctx: commands.Context):
-    """.w -> today's forecast for your saved location (set with /setlocation)"""
-    row = get_user_location(ctx.author.id)
-    if row is None:
-        await ctx.send("You haven't set a location yet — use `/setlocation` first.")
-        return
+async def weather_prefix(ctx: commands.Context, *, location: str = None):
+    """.w -> forecast for your saved location (set with /setlocation) |
+    .w <location> -> forecast for a specific city or 5-digit US ZIP,
+    without changing your saved location"""
+    if location:
+        location = location.strip()
+        zip_match = ZIP_CODE_RE.match(location)
+        resolved = await geocode_zip(zip_match.group(1)) if zip_match else await geocode_location(location)
+        if resolved is None:
+            await ctx.send(f"Couldn't find a place called \"{location}\" — try being more specific.")
+            return
+        display_name, latitude, longitude, tz_name = resolved
+    else:
+        row = get_user_location(ctx.author.id)
+        if row is None:
+            await ctx.send(
+                "You haven't set a location yet — use `/setlocation`, or check a specific "
+                "place with `.w <location>`."
+            )
+            return
+        display_name, latitude, longitude, tz_name = row["location_name"], row["latitude"], row["longitude"], row["tz_name"]
 
-    forecast = await fetch_forecast(row["latitude"], row["longitude"], row["tz_name"])
+    forecast = await fetch_forecast(latitude, longitude, tz_name)
     if forecast is None:
         await ctx.send("Couldn't reach the weather service right now — try again in a bit.")
         return
 
-    await ctx.send(format_forecast_message(row["location_name"], forecast))
+    await ctx.send(format_forecast_message(display_name, forecast))
 
 
 @bot.event
