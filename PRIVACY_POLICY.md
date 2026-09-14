@@ -44,6 +44,12 @@ visible to:
   the Bot's own commands and report channels.
 - Us, as the Bot's operator, to the extent necessary to maintain, debug,
   or secure the Bot.
+- Weather lookups are the one exception: when you run `/setlocation`, the
+  city name or ZIP code you enter is sent to Open-Meteo's geocoding service
+  (or, for ZIP codes, Zippopotam) to resolve it to a location, and `.w`
+  sends your saved coordinates to Open-Meteo to fetch a forecast. Neither
+  service is given your Discord identity. We do not store the raw ZIP code
+  — only the resolved city/state name and coordinates.
 
 The Bot operates on top of Discord, and your use of Discord itself is
 separately governed by [Discord's Privacy Policy](https://discord.com/privacy).

@@ -23,8 +23,9 @@ FEATURES
     search text with ".q s <keyword>"
   - /setreportchannel, /setoncallrole, /setnoquoterole - per-server config
   - /capybara - posts a random capybara gif (needs KLIPY_API_KEY)
-  - /setlocation + ".w" - set your location once, then ".w" shows today's
-    forecast for it (Open-Meteo, no API key needed)
+  - /setlocation + ".w" - set your location once (city name or 5-digit US
+    ZIP), then ".w" shows today's forecast for it (Open-Meteo, no API key
+    needed)
 
 SETUP
 1. pip install -U discord.py     (sqlite3 is in the Python standard library)
@@ -2172,6 +2173,42 @@ async def geocode_location(query: str):
     return display_name, place["latitude"], place["longitude"], place.get("timezone") or "auto"
 
 
+ZIP_CODE_RE = re.compile(r"^(\d{5})(?:-\d{4})?$")
+
+
+async def geocode_zip(zip_code: str):
+    """Resolves a 5-digit US ZIP code to (display_name, lat, lon, tz_name)
+    via Zippopotam (free, no key). display_name is just city/state — the ZIP
+    itself is never shown back. Returns None if nothing matched or the
+    service is unreachable."""
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"https://api.zippopotam.us/us/{zip_code}",
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.json()
+    except (aiohttp.ClientError, TimeoutError):
+        return None
+
+    places = data.get("places") or []
+    if not places:
+        return None
+
+    place = places[0]
+    try:
+        latitude = float(place["latitude"])
+        longitude = float(place["longitude"])
+    except (KeyError, ValueError, TypeError):
+        return None
+
+    state = place.get("state abbreviation") or place.get("state")
+    display_name = f"{place['place name']}, {state}" if state else place["place name"]
+    return display_name, latitude, longitude, "auto"
+
+
 async def fetch_forecast(latitude: float, longitude: float, tz_name: str):
     """Returns {'current': {...}, 'daily': {...}} from Open-Meteo — current
     conditions plus today's high/low/precipitation chance — or None on
@@ -2241,10 +2278,13 @@ def format_forecast_message(location_name: str, forecast: dict) -> str:
 
 
 @bot.tree.command(name="setlocation", description="Set your location so .w can look up today's forecast.")
-@app_commands.describe(location="A city name, e.g. 'Austin, TX' or 'London, UK'")
+@app_commands.describe(location="A city name ('Austin, TX'), or a 5-digit US ZIP code ('78701')")
 async def setlocation(interaction: discord.Interaction, location: str):
     await interaction.response.defer(ephemeral=True)
-    resolved = await geocode_location(location)
+    location = location.strip()
+
+    zip_match = ZIP_CODE_RE.match(location)
+    resolved = await geocode_zip(zip_match.group(1)) if zip_match else await geocode_location(location)
     if resolved is None:
         await interaction.followup.send(f"Couldn't find a place called \"{location}\" — try being more specific.")
         return

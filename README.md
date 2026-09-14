@@ -73,8 +73,11 @@ To add poohbot to your server: [Click this link](https://discord.com/oauth2/auth
 - `/fu` draws a middle finger in ASCII art.
 
 **Weather**
-- `/setlocation` saves a city (e.g. `Austin, TX`) against your Discord
-  account — one location per user, shared across every server you're in.
+- `/setlocation` saves a city (e.g. `Austin, TX`) or a 5-digit US ZIP code
+  (e.g. `78701`) against your Discord account — one location per user,
+  shared across every server you're in. ZIP codes are resolved to a
+  city/state (via Zippopotam) and only that city/state is ever shown back —
+  the ZIP itself isn't displayed or shared with anyone.
 - `.w` (or `.weather`) replies with the current conditions and today's
   forecast for your saved location: current temperature, humidity, wind
   speed/direction, plus today's high/low and chance of precipitation — all
@@ -125,7 +128,7 @@ To add poohbot to your server: [Click this link](https://discord.com/oauth2/auth
 | `/capybara` | Anyone | Post a random capybara gif (needs `KLIPY_API_KEY`) |
 | `/foxxo` | Anyone | Post a random fox gif (needs `KLIPY_API_KEY`) |
 | `/fu` | Anyone | Draw a middle finger in ASCII art |
-| `/setlocation` | Anyone | Save your location for `.w` |
+| `/setlocation` | Anyone | Save your location (city or US ZIP) for `.w` |
 | `.w` / `.weather` | Anyone | Show today's forecast for your saved location |
 | `/clearlocation` | Anyone (self only) | Delete your own saved location |
 | `.q` / `.q <number>` / `.q @user` / `.q me` | Anyone | Recall a quote (random / by number / by author / your own) |
