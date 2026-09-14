@@ -1,6 +1,6 @@
 # Privacy Policy
 
-**Last updated: 8 September 2026**
+**Last updated: 14 September 2026**
 
 This Privacy Policy explains what data **PoohBot** (the "Bot") collects,
 how it is used, and how it is stored. The Bot is operated by **Poohstrnak** ("we," "us," or "our"). By adding the Bot to a Discord
@@ -20,6 +20,7 @@ server(s) that run it:
 | Quotes | A user reacts 💬 to a message | Quoted message's content and any image attachment, the author's ID, channel/message IDs, the ID of the user who saved it, timestamps |
 | Moderator DMs | A moderator uses the DM feature | Message content sent to and received from the user, associated Discord IDs |
 | Server configuration | An admin runs a setup command | Configured channel IDs, role IDs, and bot status preferences |
+| Saved location | A user runs `/setlocation` | User's ID, the resolved place name, latitude/longitude, and timezone. Unlike the data above, this is tied to you personally rather than one server, and is used across every server you share with the Bot. |
 
 We do **not** collect data outside of these features — for example, the Bot
 does not log ordinary messages that are never reported, reacted to with a
@@ -65,6 +66,10 @@ Data persists until:
 
 We do not automatically delete data on a fixed schedule unless a server
 administrator configures the Bot to do so.
+
+Saved locations are the exception: since this data belongs to you rather
+than a server, you can delete it yourself at any time by running
+`/clearlocation`.
 
 ## 6. Your Rights
 

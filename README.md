@@ -72,6 +72,15 @@ To add poohbot to your server: [Click this link](https://discord.com/oauth2/auth
 - `/foxxo` posts a random fox gif, same Klipy setup as `/capybara`.
 - `/fu` draws a middle finger in ASCII art.
 
+**Weather**
+- `/setlocation` saves a city (e.g. `Austin, TX`) against your Discord
+  account — one location per user, shared across every server you're in.
+- `.w` (or `.weather`) replies with today's forecast — condition, high/low,
+  and chance of precipitation — for your saved location. Geocoding and
+  forecasts come from Open-Meteo; no API key needed.
+- `/clearlocation` deletes your saved location. It's tied to you rather than
+  a server, so this is self-service — no mod involvement needed.
+
 **Moderator DMs**
 - `/dm` sends a message to a user on the moderation team's behalf, creating a
   dedicated conversation thread per user. The user's DM replies are relayed
@@ -114,6 +123,9 @@ To add poohbot to your server: [Click this link](https://discord.com/oauth2/auth
 | `/capybara` | Anyone | Post a random capybara gif (needs `KLIPY_API_KEY`) |
 | `/foxxo` | Anyone | Post a random fox gif (needs `KLIPY_API_KEY`) |
 | `/fu` | Anyone | Draw a middle finger in ASCII art |
+| `/setlocation` | Anyone | Save your location for `.w` |
+| `.w` / `.weather` | Anyone | Show today's forecast for your saved location |
+| `/clearlocation` | Anyone (self only) | Delete your own saved location |
 | `.q` / `.q <number>` / `.q @user` / `.q me` | Anyone | Recall a quote (random / by number / by author / your own) |
 | `.q list` / `.q s <keyword>` | Anyone | Browse or search saved quotes |
 | `.q delete <number>` | Quote's adder, or Manage Messages | Delete a quote by number |
@@ -142,8 +154,8 @@ main report channel if left unset.
      Read Message History, Manage Messages, Moderate Members, Manage
      Threads, Create Public Threads**.
    - On the Bot page, turn on **Message Content Intent** — required for the
-     `.q` and "good bot" text commands to see message content. Everything
-     else (slash commands, reactions) works without it.
+     `.q`, `.w`, and "good bot" text commands to see message content.
+     Everything else (slash commands, reactions) works without it.
 
 3. **Set environment variables:**
    ```bash

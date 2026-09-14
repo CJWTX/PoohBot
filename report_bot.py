@@ -23,6 +23,8 @@ FEATURES
     search text with ".q s <keyword>"
   - /setreportchannel, /setoncallrole, /setnoquoterole - per-server config
   - /capybara - posts a random capybara gif (needs KLIPY_API_KEY)
+  - /setlocation + ".w" - set your location once, then ".w" shows today's
+    forecast for it (Open-Meteo, no API key needed)
 
 SETUP
 1. pip install -U discord.py     (sqlite3 is in the Python standard library)
@@ -32,8 +34,9 @@ SETUP
      Manage Messages (for the Delete button), Moderate Members (for
      the Timeout button), Create Public Threads
    - IMPORTANT: on the Bot page, turn ON "Message Content Intent".
-     It's required for the ".q" text command to be visible to the bot.
-     (Everything else works without it; slash commands are unaffected.)
+     It's required for the ".q" and ".w" text commands to be visible to
+     the bot. (Everything else works without it; slash commands are
+     unaffected.)
 3. export DISCORD_BOT_TOKEN="your-token-here"
    (optional) export TEST_GUILD_ID="your-server-id"   for instant command sync while testing
    (optional) export KLIPY_API_KEY="your-klipy-key"   required for /capybara
@@ -173,6 +176,17 @@ def init_db():
             added_by_id INTEGER,
             created_at TEXT,
             PRIMARY KEY (guild_id, webhook_id)
+        )"""
+    )
+    # A user's saved location for .w — one per user, independent of server.
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS user_locations (
+            user_id INTEGER PRIMARY KEY,
+            location_name TEXT,
+            latitude REAL,
+            longitude REAL,
+            tz_name TEXT,
+            created_at TEXT
         )"""
     )
     conn.commit()
@@ -355,6 +369,35 @@ def is_no_quote_webhook(guild_id: int, webhook_id: int) -> bool:
     ).fetchone()
     conn.close()
     return row is not None
+
+
+def set_user_location(user_id: int, location_name: str, latitude: float, longitude: float, tz_name: str):
+    conn = db_connect()
+    conn.execute(
+        "INSERT INTO user_locations (user_id, location_name, latitude, longitude, tz_name, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(user_id) DO UPDATE SET location_name = excluded.location_name, "
+        "latitude = excluded.latitude, longitude = excluded.longitude, tz_name = excluded.tz_name, "
+        "created_at = excluded.created_at",
+        (user_id, location_name, latitude, longitude, tz_name, datetime.now(timezone.utc).isoformat()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_user_location(user_id: int):
+    conn = db_connect()
+    row = conn.execute("SELECT * FROM user_locations WHERE user_id = ?", (user_id,)).fetchone()
+    conn.close()
+    return row
+
+
+def delete_user_location(user_id: int) -> bool:
+    conn = db_connect()
+    cur = conn.execute("DELETE FROM user_locations WHERE user_id = ?", (user_id,))
+    conn.commit()
+    conn.close()
+    return cur.rowcount > 0
 
 
 def set_simonsays_log_channel(guild_id: int, channel_id: int):
@@ -2062,6 +2105,149 @@ FU_ASCII = r"""
 @bot.tree.command(name="fu", description="Draw a middle finger in ASCII art.")
 async def fu(interaction: discord.Interaction):
     await interaction.response.send_message(f"```{FU_ASCII}```")
+
+
+# ---------- weather (.w) ----------
+
+WEATHER_CODES = {
+    0: "Clear sky",
+    1: "Mainly clear",
+    2: "Partly cloudy",
+    3: "Overcast",
+    45: "Fog",
+    48: "Depositing rime fog",
+    51: "Light drizzle",
+    53: "Moderate drizzle",
+    55: "Dense drizzle",
+    56: "Light freezing drizzle",
+    57: "Dense freezing drizzle",
+    61: "Slight rain",
+    63: "Moderate rain",
+    65: "Heavy rain",
+    66: "Light freezing rain",
+    67: "Heavy freezing rain",
+    71: "Slight snow fall",
+    73: "Moderate snow fall",
+    75: "Heavy snow fall",
+    77: "Snow grains",
+    80: "Slight rain showers",
+    81: "Moderate rain showers",
+    82: "Violent rain showers",
+    85: "Slight snow showers",
+    86: "Heavy snow showers",
+    95: "Thunderstorm",
+    96: "Thunderstorm with slight hail",
+    99: "Thunderstorm with heavy hail",
+}
+
+
+async def geocode_location(query: str):
+    """Resolves free-text like 'Austin, TX' to (display_name, lat, lon,
+    tz_name) via Open-Meteo's geocoding API (no key required). Returns None
+    if nothing matched or the service is unreachable."""
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                "https://geocoding-api.open-meteo.com/v1/search",
+                params={"name": query, "count": "1", "language": "en", "format": "json"},
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.json()
+    except (aiohttp.ClientError, TimeoutError):
+        return None
+
+    results = data.get("results") or []
+    if not results:
+        return None
+
+    place = results[0]
+    parts = [place["name"]]
+    if place.get("admin1"):
+        parts.append(place["admin1"])
+    if place.get("country"):
+        parts.append(place["country"])
+    display_name = ", ".join(parts)
+    return display_name, place["latitude"], place["longitude"], place.get("timezone") or "auto"
+
+
+async def fetch_daily_forecast(latitude: float, longitude: float, tz_name: str):
+    """Returns today's {weather_code, temperature_2m_max/min,
+    precipitation_probability_max} lists from Open-Meteo, or None on
+    failure."""
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                "https://api.open-meteo.com/v1/forecast",
+                params={
+                    "latitude": str(latitude),
+                    "longitude": str(longitude),
+                    "daily": "weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max",
+                    "temperature_unit": "fahrenheit",
+                    "precipitation_unit": "inch",
+                    "timezone": tz_name or "auto",
+                    "forecast_days": "1",
+                },
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.json()
+    except (aiohttp.ClientError, TimeoutError):
+        return None
+
+    daily = data.get("daily")
+    if not daily or not daily.get("time"):
+        return None
+    return daily
+
+
+def format_forecast_message(location_name: str, daily: dict) -> str:
+    condition = WEATHER_CODES.get(daily["weather_code"][0], "Unknown conditions")
+    high = round(daily["temperature_2m_max"][0])
+    low = round(daily["temperature_2m_min"][0])
+    precip = (daily.get("precipitation_probability_max") or [None])[0]
+    precip_text = f" | {precip}% chance of precipitation" if precip is not None else ""
+    return f"**{location_name}** — {condition}, high {high}°F / low {low}°F{precip_text}"
+
+
+@bot.tree.command(name="setlocation", description="Set your location so .w can look up today's forecast.")
+@app_commands.describe(location="A city name, e.g. 'Austin, TX' or 'London, UK'")
+async def setlocation(interaction: discord.Interaction, location: str):
+    await interaction.response.defer(ephemeral=True)
+    resolved = await geocode_location(location)
+    if resolved is None:
+        await interaction.followup.send(f"Couldn't find a place called \"{location}\" — try being more specific.")
+        return
+
+    display_name, latitude, longitude, tz_name = resolved
+    set_user_location(interaction.user.id, display_name, latitude, longitude, tz_name)
+    await interaction.followup.send(f"Location set to **{display_name}**. Try `.w` to see today's forecast.")
+
+
+@bot.tree.command(name="clearlocation", description="Delete your saved location.")
+async def clearlocation(interaction: discord.Interaction):
+    if delete_user_location(interaction.user.id):
+        await interaction.response.send_message("Your saved location has been deleted.", ephemeral=True)
+    else:
+        await interaction.response.send_message("You don't have a saved location.", ephemeral=True)
+
+
+@bot.command(name="w", aliases=["weather"])
+async def weather_prefix(ctx: commands.Context):
+    """.w -> today's forecast for your saved location (set with /setlocation)"""
+    row = get_user_location(ctx.author.id)
+    if row is None:
+        await ctx.send("You haven't set a location yet — use `/setlocation` first.")
+        return
+
+    daily = await fetch_daily_forecast(row["latitude"], row["longitude"], row["tz_name"])
+    if daily is None:
+        await ctx.send("Couldn't reach the weather service right now — try again in a bit.")
+        return
+
+    await ctx.send(format_forecast_message(row["location_name"], daily))
 
 
 @bot.event
