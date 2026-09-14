@@ -56,6 +56,10 @@ To add poohbot to your server: [Click this link](https://discord.com/oauth2/auth
   confirmation prompt.
 - `/setnoquoterole` exempts a role's members from ever being quoted — 💬
   reactions on their messages are silently ignored.
+- **Toggle No-Quote Webhook** (right-click a message, Manage Server) exempts
+  messages posted through a webhook the same way — needed for bots that post
+  with a custom name/avatar per message, since those carry no Discord role
+  data for `/setnoquoterole` to check. Right-clicking again un-exempts it.
 - `import_quotes.py` (run separately, not a bot command) bulk-imports a
   `quotes.json` export from another quote bot into `reportbot.db`.
 
@@ -118,6 +122,7 @@ To add poohbot to your server: [Click this link](https://discord.com/oauth2/auth
 | `/delquote` | Manage Messages | Delete a quote by number |
 | `/defragquotes` | Manage Messages | Renumber quotes to close gaps (confirms first) |
 | `/setnoquoterole` | Manage Server | Exempt a role's members from being quoted |
+| **Toggle No-Quote Webhook** (right-click) | Manage Server | Exempt/un-exempt a webhook's messages from being quoted |
 
 Channel settings (`setpinrequestchannel`, `setdmchannel`) fall back to the
 main report channel if left unset.
