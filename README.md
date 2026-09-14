@@ -75,9 +75,11 @@ To add poohbot to your server: [Click this link](https://discord.com/oauth2/auth
 **Weather**
 - `/setlocation` saves a city (e.g. `Austin, TX`) against your Discord
   account — one location per user, shared across every server you're in.
-- `.w` (or `.weather`) replies with today's forecast — condition, high/low,
-  and chance of precipitation — for your saved location. Geocoding and
-  forecasts come from Open-Meteo; no API key needed.
+- `.w` (or `.weather`) replies with the current conditions and today's
+  forecast for your saved location: current temperature, humidity, wind
+  speed/direction, plus today's high/low and chance of precipitation — all
+  temperatures shown in both °F and °C. Geocoding and forecasts come from
+  Open-Meteo; no API key needed.
 - `/clearlocation` deletes your saved location. It's tied to you rather than
   a server, so this is self-service — no mod involvement needed.
 

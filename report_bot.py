@@ -2172,10 +2172,11 @@ async def geocode_location(query: str):
     return display_name, place["latitude"], place["longitude"], place.get("timezone") or "auto"
 
 
-async def fetch_daily_forecast(latitude: float, longitude: float, tz_name: str):
-    """Returns today's {weather_code, temperature_2m_max/min,
-    precipitation_probability_max} lists from Open-Meteo, or None on
-    failure."""
+async def fetch_forecast(latitude: float, longitude: float, tz_name: str):
+    """Returns {'current': {...}, 'daily': {...}} from Open-Meteo — current
+    conditions plus today's high/low/precipitation chance — or None on
+    failure. Temperatures come back in Celsius; format_forecast_message
+    converts for display."""
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(
@@ -2183,9 +2184,9 @@ async def fetch_daily_forecast(latitude: float, longitude: float, tz_name: str):
                 params={
                     "latitude": str(latitude),
                     "longitude": str(longitude),
+                    "current": "temperature_2m,relative_humidity_2m,wind_speed_10m,wind_direction_10m,weather_code",
                     "daily": "weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max",
-                    "temperature_unit": "fahrenheit",
-                    "precipitation_unit": "inch",
+                    "wind_speed_unit": "mph",
                     "timezone": tz_name or "auto",
                     "forecast_days": "1",
                 },
@@ -2198,18 +2199,45 @@ async def fetch_daily_forecast(latitude: float, longitude: float, tz_name: str):
         return None
 
     daily = data.get("daily")
-    if not daily or not daily.get("time"):
+    current = data.get("current")
+    if not daily or not daily.get("time") or not current:
         return None
-    return daily
+    return {"daily": daily, "current": current}
 
 
-def format_forecast_message(location_name: str, daily: dict) -> str:
-    condition = WEATHER_CODES.get(daily["weather_code"][0], "Unknown conditions")
-    high = round(daily["temperature_2m_max"][0])
-    low = round(daily["temperature_2m_min"][0])
+COMPASS_POINTS = (
+    "N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE",
+    "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW",
+)
+
+
+def degrees_to_compass(degrees: float) -> str:
+    return COMPASS_POINTS[round(degrees / 22.5) % 16]
+
+
+def format_temp(celsius: float) -> str:
+    fahrenheit = celsius * 9 / 5 + 32
+    return f"{round(fahrenheit)}°F ({round(celsius)}°C)"
+
+
+def format_forecast_message(location_name: str, forecast: dict) -> str:
+    daily = forecast["daily"]
+    current = forecast["current"]
+
+    condition = WEATHER_CODES.get(current["weather_code"], "Unknown conditions")
+    current_temp = format_temp(current["temperature_2m"])
+    high = format_temp(daily["temperature_2m_max"][0])
+    low = format_temp(daily["temperature_2m_min"][0])
     precip = (daily.get("precipitation_probability_max") or [None])[0]
     precip_text = f" | {precip}% chance of precipitation" if precip is not None else ""
-    return f"**{location_name}** — {condition}, high {high}°F / low {low}°F{precip_text}"
+
+    return (
+        f"**{location_name}** — {condition}, {current_temp}\n"
+        f"High {high} / Low {low}{precip_text}\n"
+        f"Humidity: {round(current['relative_humidity_2m'])}% | "
+        f"Wind: {degrees_to_compass(current['wind_direction_10m'])} @ "
+        f"{round(current['wind_speed_10m'])}mph"
+    )
 
 
 @bot.tree.command(name="setlocation", description="Set your location so .w can look up today's forecast.")
@@ -2242,12 +2270,12 @@ async def weather_prefix(ctx: commands.Context):
         await ctx.send("You haven't set a location yet — use `/setlocation` first.")
         return
 
-    daily = await fetch_daily_forecast(row["latitude"], row["longitude"], row["tz_name"])
-    if daily is None:
+    forecast = await fetch_forecast(row["latitude"], row["longitude"], row["tz_name"])
+    if forecast is None:
         await ctx.send("Couldn't reach the weather service right now — try again in a bit.")
         return
 
-    await ctx.send(format_forecast_message(row["location_name"], daily))
+    await ctx.send(format_forecast_message(row["location_name"], forecast))
 
 
 @bot.event
