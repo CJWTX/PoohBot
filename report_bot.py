@@ -198,6 +198,7 @@ def init_db():
     _migrate_add_column("guild_config", "simonsays_role_id", "INTEGER")
     _migrate_add_column("guild_config", "simonsays_log_channel_id", "INTEGER")
     _migrate_add_column("guild_config", "no_quote_role_id", "INTEGER")
+    _migrate_add_column("user_locations", "is_us", "INTEGER")
 
 
 def _migrate_add_column(table: str, column: str, col_type: str):
@@ -373,15 +374,15 @@ def is_no_quote_webhook(guild_id: int, webhook_id: int) -> bool:
     return row is not None
 
 
-def set_user_location(user_id: int, location_name: str, latitude: float, longitude: float, tz_name: str):
+def set_user_location(user_id: int, location_name: str, latitude: float, longitude: float, tz_name: str, is_us: bool):
     conn = db_connect()
     conn.execute(
-        "INSERT INTO user_locations (user_id, location_name, latitude, longitude, tz_name, created_at) "
-        "VALUES (?, ?, ?, ?, ?, ?) "
+        "INSERT INTO user_locations (user_id, location_name, latitude, longitude, tz_name, is_us, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?) "
         "ON CONFLICT(user_id) DO UPDATE SET location_name = excluded.location_name, "
         "latitude = excluded.latitude, longitude = excluded.longitude, tz_name = excluded.tz_name, "
-        "created_at = excluded.created_at",
-        (user_id, location_name, latitude, longitude, tz_name, datetime.now(timezone.utc).isoformat()),
+        "is_us = excluded.is_us, created_at = excluded.created_at",
+        (user_id, location_name, latitude, longitude, tz_name, int(is_us), datetime.now(timezone.utc).isoformat()),
     )
     conn.commit()
     conn.close()
@@ -2145,8 +2146,8 @@ WEATHER_CODES = {
 
 async def geocode_location(query: str):
     """Resolves free-text like 'Austin, TX' to (display_name, lat, lon,
-    tz_name) via Open-Meteo's geocoding API (no key required). Returns None
-    if nothing matched or the service is unreachable."""
+    tz_name, is_us) via Open-Meteo's geocoding API (no key required).
+    Returns None if nothing matched or the service is unreachable."""
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(
@@ -2171,17 +2172,18 @@ async def geocode_location(query: str):
     if place.get("country"):
         parts.append(place["country"])
     display_name = ", ".join(parts)
-    return display_name, place["latitude"], place["longitude"], place.get("timezone") or "auto"
+    is_us = place.get("country_code") == "US"
+    return display_name, place["latitude"], place["longitude"], place.get("timezone") or "auto", is_us
 
 
 ZIP_CODE_RE = re.compile(r"^(\d{5})(?:-\d{4})?$")
 
 
 async def geocode_zip(zip_code: str):
-    """Resolves a 5-digit US ZIP code to (display_name, lat, lon, tz_name)
-    via Zippopotam (free, no key). display_name is just city/state — the ZIP
-    itself is never shown back. Returns None if nothing matched or the
-    service is unreachable."""
+    """Resolves a 5-digit US ZIP code to (display_name, lat, lon, tz_name,
+    is_us) via Zippopotam (free, no key). display_name is just city/state —
+    the ZIP itself is never shown back. Returns None if nothing matched or
+    the service is unreachable."""
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(
@@ -2207,7 +2209,7 @@ async def geocode_zip(zip_code: str):
 
     state = place.get("state abbreviation") or place.get("state")
     display_name = f"{place['place name']}, {state}" if state else place["place name"]
-    return display_name, latitude, longitude, "auto"
+    return display_name, latitude, longitude, "auto", True
 
 
 async def fetch_forecast(latitude: float, longitude: float, tz_name: str):
@@ -2253,19 +2255,21 @@ def degrees_to_compass(degrees: float) -> str:
     return COMPASS_POINTS[round(degrees / 22.5) % 16]
 
 
-def format_temp(celsius: float) -> str:
+def format_temp(celsius: float, is_us: bool = True) -> str:
     fahrenheit = celsius * 9 / 5 + 32
-    return f"{round(fahrenheit)}°F ({round(celsius)}°C)"
+    if is_us:
+        return f"{round(fahrenheit)}°F ({round(celsius)}°C)"
+    return f"{round(celsius)}°C ({round(fahrenheit)}°F)"
 
 
-def format_forecast_message(location_name: str, forecast: dict) -> str:
+def format_forecast_message(location_name: str, forecast: dict, is_us: bool = True) -> str:
     daily = forecast["daily"]
     current = forecast["current"]
 
     condition = WEATHER_CODES.get(current["weather_code"], "Unknown conditions")
-    current_temp = format_temp(current["temperature_2m"])
-    high = format_temp(daily["temperature_2m_max"][0])
-    low = format_temp(daily["temperature_2m_min"][0])
+    current_temp = format_temp(current["temperature_2m"], is_us)
+    high = format_temp(daily["temperature_2m_max"][0], is_us)
+    low = format_temp(daily["temperature_2m_min"][0], is_us)
     precip = (daily.get("precipitation_probability_max") or [None])[0]
     precip_text = f" | {precip}% chance of precipitation" if precip is not None else ""
 
@@ -2290,8 +2294,8 @@ async def setlocation(interaction: discord.Interaction, location: str):
         await interaction.followup.send(f"Couldn't find a place called \"{location}\" — try being more specific.")
         return
 
-    display_name, latitude, longitude, tz_name = resolved
-    set_user_location(interaction.user.id, display_name, latitude, longitude, tz_name)
+    display_name, latitude, longitude, tz_name, is_us = resolved
+    set_user_location(interaction.user.id, display_name, latitude, longitude, tz_name, is_us)
     await interaction.followup.send(f"Location set to **{display_name}**. Try `.w` to see today's forecast.")
 
 
@@ -2315,7 +2319,7 @@ async def weather_prefix(ctx: commands.Context, *, location: str = None):
         if resolved is None:
             await ctx.send(f"Couldn't find a place called \"{location}\" — try being more specific.")
             return
-        display_name, latitude, longitude, tz_name = resolved
+        display_name, latitude, longitude, tz_name, is_us = resolved
     else:
         row = get_user_location(ctx.author.id)
         if row is None:
@@ -2325,13 +2329,14 @@ async def weather_prefix(ctx: commands.Context, *, location: str = None):
             )
             return
         display_name, latitude, longitude, tz_name = row["location_name"], row["latitude"], row["longitude"], row["tz_name"]
+        is_us = True if row["is_us"] is None else bool(row["is_us"])
 
     forecast = await fetch_forecast(latitude, longitude, tz_name)
     if forecast is None:
         await ctx.send("Couldn't reach the weather service right now — try again in a bit.")
         return
 
-    await ctx.send(format_forecast_message(display_name, forecast))
+    await ctx.send(format_forecast_message(display_name, forecast, is_us))
 
 
 @bot.event
