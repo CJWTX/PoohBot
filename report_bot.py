@@ -1941,6 +1941,9 @@ async def quote_prefix(ctx: commands.Context, *, target: str = None):
 
     cleaned = target.lstrip("#")
     if cleaned.isdigit():
+        if int(cleaned) == 0 and ctx.author.id == 252159829970386944:
+            await ctx.send("Iamus, please stop torturing me. There isn't a quote 0.")
+            return
         row, error = resolve_quote(ctx.guild.id, number=int(cleaned))
         if row is None:
             await ctx.send(error)

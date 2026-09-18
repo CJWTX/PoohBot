@@ -4,3 +4,4 @@ token.env
 venv/
 __pycache__/
 reportchannels.json
+reportbot.db.bak-*
