@@ -27,6 +27,8 @@ FEATURES
     ZIP), then ".w" shows today's forecast for it; ".w <location>" checks
     any place one-off without changing what's saved (Open-Meteo, no API
     key needed)
+  - /setwindunit - choose mph (default), km/h, or knots for wind speed in
+    ".w" forecasts
 
 SETUP
 1. pip install -U discord.py     (sqlite3 is in the Python standard library)
@@ -199,6 +201,7 @@ def init_db():
     _migrate_add_column("guild_config", "simonsays_log_channel_id", "INTEGER")
     _migrate_add_column("guild_config", "no_quote_role_id", "INTEGER")
     _migrate_add_column("user_locations", "is_us", "INTEGER")
+    _migrate_add_column("user_locations", "wind_speed_unit", "TEXT")
 
 
 def _migrate_add_column(table: str, column: str, col_type: str):
@@ -393,6 +396,28 @@ def get_user_location(user_id: int):
     row = conn.execute("SELECT * FROM user_locations WHERE user_id = ?", (user_id,)).fetchone()
     conn.close()
     return row
+
+
+def set_user_wind_unit(user_id: int, wind_speed_unit: str):
+    conn = db_connect()
+    conn.execute(
+        "INSERT INTO user_locations (user_id, wind_speed_unit) VALUES (?, ?) "
+        "ON CONFLICT(user_id) DO UPDATE SET wind_speed_unit = excluded.wind_speed_unit",
+        (user_id, wind_speed_unit),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_user_wind_unit(user_id: int) -> str:
+    """Returns the user's preferred wind speed unit ('mph', 'kmh', or 'kn'),
+    defaulting to 'mph' if never set."""
+    conn = db_connect()
+    row = conn.execute("SELECT wind_speed_unit FROM user_locations WHERE user_id = ?", (user_id,)).fetchone()
+    conn.close()
+    if row is None or row["wind_speed_unit"] is None:
+        return "mph"
+    return row["wind_speed_unit"]
 
 
 def delete_user_location(user_id: int) -> bool:
@@ -1743,8 +1768,9 @@ def resolve_quote(guild_id: int, number: int = None, author_id: int = None):
         rows = get_quotes(guild_id)
         if not rows:
             return None, "No quotes saved yet — react to a message with 💬 to save one."
-        highest = max(r["quote_number"] for r in rows)
-        return None, f"There's no quote #{number} here. Saved quotes go up to #{highest}."
+        numbers = [r["quote_number"] for r in rows]
+        lowest, highest = min(numbers), max(numbers)
+        return None, f"There's no quote #{number} here. Saved quotes are numbered {lowest}-{highest}."
 
     row = get_random_quote(guild_id, author_id)
     if row is None:
@@ -2144,10 +2170,39 @@ WEATHER_CODES = {
 }
 
 
+US_STATE_CAPITALS = {
+    "alabama": "Montgomery, AL", "alaska": "Juneau, AK", "arizona": "Phoenix, AZ",
+    "arkansas": "Little Rock, AR", "california": "Sacramento, CA", "colorado": "Denver, CO",
+    "connecticut": "Hartford, CT", "delaware": "Dover, DE", "florida": "Tallahassee, FL",
+    "georgia": "Atlanta, GA", "hawaii": "Honolulu, HI", "idaho": "Boise, ID",
+    "illinois": "Springfield, IL", "indiana": "Indianapolis, IN", "iowa": "Des Moines, IA",
+    "kansas": "Topeka, KS", "kentucky": "Frankfort, KY", "louisiana": "Baton Rouge, LA",
+    "maine": "Augusta, ME", "maryland": "Annapolis, MD", "massachusetts": "Boston, MA",
+    "michigan": "Lansing, MI", "minnesota": "Saint Paul, MN", "mississippi": "Jackson, MS",
+    "missouri": "Jefferson City, MO", "montana": "Helena, MT", "nebraska": "Lincoln, NE",
+    "nevada": "Carson City, NV", "new hampshire": "Concord, NH", "new jersey": "Trenton, NJ",
+    "new mexico": "Santa Fe, NM", "new york": "Albany, NY", "north carolina": "Raleigh, NC",
+    "north dakota": "Bismarck, ND", "ohio": "Columbus, OH", "oklahoma": "Oklahoma City, OK",
+    "oregon": "Salem, OR", "pennsylvania": "Harrisburg, PA", "rhode island": "Providence, RI",
+    "south carolina": "Columbia, SC", "south dakota": "Pierre, SD", "tennessee": "Nashville, TN",
+    "texas": "Austin, TX", "utah": "Salt Lake City, UT", "vermont": "Montpelier, VT",
+    "virginia": "Richmond, VA", "washington": "Olympia, WA", "west virginia": "Charleston, WV",
+    "wisconsin": "Madison, WI", "wyoming": "Cheyenne, WY", "district of columbia": "Washington, DC",
+}
+
+
 async def geocode_location(query: str):
     """Resolves free-text like 'Austin, TX' to (display_name, lat, lon,
     tz_name, is_us) via Open-Meteo's geocoding API (no key required).
-    Returns None if nothing matched or the service is unreachable."""
+    Returns None if nothing matched or the service is unreachable.
+
+    Open-Meteo's geocoder only indexes populated places, not US states, so a
+    bare state name (e.g. 'Texas') would otherwise match on an obscure
+    alternate name for an unrelated small town. Those are redirected to the
+    state capital instead."""
+    capital = US_STATE_CAPITALS.get(query.strip().lower())
+    if capital:
+        query = capital
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(
@@ -2212,11 +2267,20 @@ async def geocode_zip(zip_code: str):
     return display_name, latitude, longitude, "auto", True
 
 
-async def fetch_forecast(latitude: float, longitude: float, tz_name: str):
+# Open-Meteo's API only understands mph/kmh/kn/ms. "gms" (gigameters per
+# second) isn't a real option it can return directly — it rides on top of
+# "ms" and gets converted for display in format_forecast_message. gms is
+# deliberately absent from /setwindunit's choices; it only takes effect if
+# someone hand-edits wind_speed_unit in the database.
+OPEN_METEO_WIND_API_UNITS = {"mph": "mph", "kmh": "kmh", "kn": "kn", "gms": "ms"}
+
+
+async def fetch_forecast(latitude: float, longitude: float, tz_name: str, wind_speed_unit: str = "mph"):
     """Returns {'current': {...}, 'daily': {...}} from Open-Meteo — current
     conditions plus today's high/low/precipitation chance — or None on
     failure. Temperatures come back in Celsius; format_forecast_message
-    converts for display."""
+    converts for display. wind_speed_unit is one of 'mph', 'kmh', 'kn', or
+    'gms' (see OPEN_METEO_WIND_API_UNITS)."""
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(
@@ -2226,7 +2290,7 @@ async def fetch_forecast(latitude: float, longitude: float, tz_name: str):
                     "longitude": str(longitude),
                     "current": "temperature_2m,relative_humidity_2m,wind_speed_10m,wind_direction_10m,weather_code",
                     "daily": "weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max",
-                    "wind_speed_unit": "mph",
+                    "wind_speed_unit": OPEN_METEO_WIND_API_UNITS.get(wind_speed_unit, "mph"),
                     "timezone": tz_name or "auto",
                     "forecast_days": "1",
                 },
@@ -2262,7 +2326,20 @@ def format_temp(celsius: float, is_us: bool = True) -> str:
     return f"{round(celsius)}°C ({round(fahrenheit)}°F)"
 
 
-def format_forecast_message(location_name: str, forecast: dict, is_us: bool = True) -> str:
+WIND_UNIT_LABELS = {"mph": "mph", "kmh": "km/h", "kn": "kt", "gms": "Gm/s"}
+
+
+def format_wind_speed(raw_speed: float, wind_speed_unit: str) -> str:
+    """raw_speed is in whatever unit OPEN_METEO_WIND_API_UNITS requested.
+    'gms' rides on the API's m/s response and gets divided down to
+    gigameters/second here, since Open-Meteo has no such unit itself."""
+    label = WIND_UNIT_LABELS.get(wind_speed_unit, wind_speed_unit)
+    if wind_speed_unit == "gms":
+        return f"{raw_speed / 1_000_000_000:.2e}{label}"
+    return f"{round(raw_speed)}{label}"
+
+
+def format_forecast_message(location_name: str, forecast: dict, is_us: bool = True, wind_speed_unit: str = "mph") -> str:
     daily = forecast["daily"]
     current = forecast["current"]
 
@@ -2278,7 +2355,7 @@ def format_forecast_message(location_name: str, forecast: dict, is_us: bool = Tr
         f"High {high} / Low {low}{precip_text}\n"
         f"Humidity: {round(current['relative_humidity_2m'])}% | "
         f"Wind: {degrees_to_compass(current['wind_direction_10m'])} @ "
-        f"{round(current['wind_speed_10m'])}mph"
+        f"{format_wind_speed(current['wind_speed_10m'], wind_speed_unit)}"
     )
 
 
@@ -2307,6 +2384,20 @@ async def clearlocation(interaction: discord.Interaction):
         await interaction.response.send_message("You don't have a saved location.", ephemeral=True)
 
 
+@bot.tree.command(name="setwindunit", description="Set your preferred wind speed unit for .w forecasts.")
+@app_commands.describe(unit="Wind speed unit to show in .w forecasts (default: mph)")
+@app_commands.choices(unit=[
+    app_commands.Choice(name="mph", value="mph"),
+    app_commands.Choice(name="km/h", value="kmh"),
+    app_commands.Choice(name="knots", value="kn"),
+])
+async def setwindunit(interaction: discord.Interaction, unit: app_commands.Choice[str]):
+    set_user_wind_unit(interaction.user.id, unit.value)
+    await interaction.response.send_message(
+        f"Wind speed will now show in **{WIND_UNIT_LABELS[unit.value]}**.", ephemeral=True
+    )
+
+
 @bot.command(name="w", aliases=["weather"])
 async def weather_prefix(ctx: commands.Context, *, location: str = None):
     """.w -> forecast for your saved location (set with /setlocation) |
@@ -2331,12 +2422,13 @@ async def weather_prefix(ctx: commands.Context, *, location: str = None):
         display_name, latitude, longitude, tz_name = row["location_name"], row["latitude"], row["longitude"], row["tz_name"]
         is_us = True if row["is_us"] is None else bool(row["is_us"])
 
-    forecast = await fetch_forecast(latitude, longitude, tz_name)
+    wind_speed_unit = get_user_wind_unit(ctx.author.id)
+    forecast = await fetch_forecast(latitude, longitude, tz_name, wind_speed_unit)
     if forecast is None:
         await ctx.send("Couldn't reach the weather service right now — try again in a bit.")
         return
 
-    await ctx.send(format_forecast_message(display_name, forecast, is_us))
+    await ctx.send(format_forecast_message(display_name, forecast, is_us, wind_speed_unit))
 
 
 @bot.event
