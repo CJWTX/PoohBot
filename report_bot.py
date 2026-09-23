@@ -29,6 +29,14 @@ FEATURES
     key needed)
   - /setwindunit - choose mph (default), km/h, or knots for wind speed in
     ".w" forecasts
+  - ".wiki <topic>" - posts the top Wikipedia result for a topic (no API
+    key needed)
+  - /setmutewhentagging, /clearmutewhentagging, /resetmuteoffenses - [bot
+    owner only] put a user on a per-server watch list that auto-times them
+    out every time they tag someone; the timeout grows by 5 seconds per
+    offense (5s, 10s, 15s, ...), with everyone's offense count resetting
+    daily at midnight UTC (or on demand with /resetmuteoffenses). Requires
+    the "Moderate Members" permission.
 
 SETUP
 1. pip install -U discord.py     (sqlite3 is in the Python standard library)
@@ -58,11 +66,13 @@ import re
 import sqlite3
 import time
 from datetime import datetime, timedelta, timezone
+from datetime import time as dt_time
+from urllib.parse import quote as url_quote
 
 import aiohttp
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 
 # ---------- tunables ----------
 
@@ -191,6 +201,19 @@ def init_db():
             longitude REAL,
             tz_name TEXT,
             created_at TEXT
+        )"""
+    )
+    # Users the bot owner has designated to be auto-timed-out any time they
+    # tag someone. offense_count tracks how many times it's fired, since the
+    # timeout length grows by a minute each time.
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS tag_mute_watch (
+            guild_id INTEGER,
+            user_id INTEGER,
+            offense_count INTEGER NOT NULL DEFAULT 0,
+            added_by_id INTEGER,
+            created_at TEXT,
+            PRIMARY KEY (guild_id, user_id)
         )"""
     )
     conn.commit()
@@ -423,6 +446,85 @@ def get_user_wind_unit(user_id: int) -> str:
 def delete_user_location(user_id: int) -> bool:
     conn = db_connect()
     cur = conn.execute("DELETE FROM user_locations WHERE user_id = ?", (user_id,))
+    conn.commit()
+    conn.close()
+    return cur.rowcount > 0
+
+
+def add_tag_mute_watch(guild_id: int, user_id: int, added_by_id: int) -> bool:
+    """Returns False (no-op) if the user was already on the watch list."""
+    conn = db_connect()
+    cur = conn.execute(
+        "INSERT OR IGNORE INTO tag_mute_watch (guild_id, user_id, offense_count, added_by_id, created_at) "
+        "VALUES (?, ?, 0, ?, ?)",
+        (guild_id, user_id, added_by_id, datetime.now(timezone.utc).isoformat()),
+    )
+    conn.commit()
+    conn.close()
+    return cur.rowcount > 0
+
+
+def remove_tag_mute_watch(guild_id: int, user_id: int) -> bool:
+    conn = db_connect()
+    cur = conn.execute(
+        "DELETE FROM tag_mute_watch WHERE guild_id = ? AND user_id = ?", (guild_id, user_id)
+    )
+    conn.commit()
+    conn.close()
+    return cur.rowcount > 0
+
+
+def is_tag_mute_watched(guild_id: int, user_id: int) -> bool:
+    conn = db_connect()
+    row = conn.execute(
+        "SELECT 1 FROM tag_mute_watch WHERE guild_id = ? AND user_id = ?", (guild_id, user_id)
+    ).fetchone()
+    conn.close()
+    return row is not None
+
+
+def bump_tag_mute_offense(guild_id: int, user_id: int) -> int:
+    """Increments the offense counter for a watched user and returns the new
+    count (1 on their first offense, 2 on their second, ...)."""
+    conn = db_connect()
+    conn.execute(
+        "UPDATE tag_mute_watch SET offense_count = offense_count + 1 WHERE guild_id = ? AND user_id = ?",
+        (guild_id, user_id),
+    )
+    conn.commit()
+    row = conn.execute(
+        "SELECT offense_count FROM tag_mute_watch WHERE guild_id = ? AND user_id = ?", (guild_id, user_id)
+    ).fetchone()
+    conn.close()
+    return row["offense_count"] if row else 0
+
+
+def get_tag_mute_watchlist(guild_id: int):
+    conn = db_connect()
+    rows = conn.execute(
+        "SELECT * FROM tag_mute_watch WHERE guild_id = ? ORDER BY created_at", (guild_id,)
+    ).fetchall()
+    conn.close()
+    return rows
+
+
+def reset_all_tag_mute_offenses():
+    """Zeroes the offense counter for every watched user, across every
+    server. Run once a day so the timeout escalation doesn't accumulate
+    forever."""
+    conn = db_connect()
+    conn.execute("UPDATE tag_mute_watch SET offense_count = 0")
+    conn.commit()
+    conn.close()
+
+
+def reset_tag_mute_offense(guild_id: int, user_id: int) -> bool:
+    """Zeroes one watched user's offense counter without removing them from
+    the watch list. Returns False if they weren't being watched."""
+    conn = db_connect()
+    cur = conn.execute(
+        "UPDATE tag_mute_watch SET offense_count = 0 WHERE guild_id = ? AND user_id = ?", (guild_id, user_id)
+    )
     conn.commit()
     conn.close()
     return cur.rowcount > 0
@@ -705,6 +807,8 @@ def get_random_quote(guild_id: int, author_id: int = None):
 
 
 def delete_quote(guild_id: int, quote_number: int) -> bool:
+    """Deletes a quote and renumbers the rest so numbering stays 1..N with no
+    gap. Returns False if there was no such quote."""
     conn = db_connect()
     cur = conn.execute(
         "DELETE FROM quotes WHERE guild_id = ? AND quote_number = ?", (guild_id, quote_number)
@@ -712,6 +816,8 @@ def delete_quote(guild_id: int, quote_number: int) -> bool:
     conn.commit()
     deleted = cur.rowcount > 0
     conn.close()
+    if deleted:
+        renumber_quotes(guild_id)
     return deleted
 
 
@@ -783,6 +889,51 @@ async def maybe_reply_good_bot(message: discord.Message):
         await message.channel.send("no u")
     except (discord.Forbidden, discord.HTTPException):
         pass
+
+
+# ---------- tag-mute watch list ----------
+
+TAG_MUTE_SECONDS_PER_OFFENSE = 5
+TAG_MUTE_CAP_SECONDS = 40320 * 60  # Discord's timeout cap is 28 days
+
+# Matches an explicit user mention typed into the message content, e.g.
+# "<@123>" or "<@!123>". Deliberately narrower than message.mentions, which
+# also includes the person being replied to (Discord auto-pings them on
+# reply even with no literal "@" in the text) — replies alone shouldn't
+# count as tagging someone.
+USER_MENTION_RE = re.compile(r"<@!?(\d+)>")
+
+
+async def maybe_tag_mute(message: discord.Message):
+    """If the message author is on the guild's tag-mute watch list and just
+    tagged someone else (an explicit @mention, not just a reply, and not the
+    bot itself), times them out — 5 seconds the first time, growing by 5
+    more seconds on every offense after that."""
+    if message.guild is None or not isinstance(message.author, discord.Member):
+        return
+    if not is_tag_mute_watched(message.guild.id, message.author.id):
+        return
+
+    mentioned_ids = {int(uid) for uid in USER_MENTION_RE.findall(message.content or "")}
+    # Pinging the bot itself (e.g. to use a feature) is always allowed.
+    exempt_ids = {message.author.id, bot.user.id}
+    tagged_someone_else = any(uid not in exempt_ids for uid in mentioned_ids)
+    if not tagged_someone_else:
+        return
+
+    offense_count = bump_tag_mute_offense(message.guild.id, message.author.id)
+    seconds = min(offense_count * TAG_MUTE_SECONDS_PER_OFFENSE, TAG_MUTE_CAP_SECONDS)
+    try:
+        await message.author.timeout(
+            discord.utils.utcnow() + timedelta(seconds=seconds),
+            reason=f"Tag-mute watch: offense #{offense_count}",
+        )
+        await message.channel.send(
+            f"🔇 {message.author.mention} was timed out for {seconds} second(s) for tagging someone "
+            f"(offense #{offense_count})."
+        )
+    except (discord.Forbidden, discord.HTTPException):
+        pass  # missing permission / role hierarchy issue — fail silently, like other mod actions
 
 
 # ---------- bot setup ----------
@@ -1320,7 +1471,7 @@ async def _can_use_simonsays(interaction: discord.Interaction) -> bool:
 @app_commands.describe(text="What the bot should say")
 @app_commands.check(_can_use_simonsays)
 async def simon_says(interaction: discord.Interaction, text: str):
-    await interaction.channel.send(text)
+    sent_message = await interaction.channel.send(text)
     await interaction.response.send_message("Said it.", ephemeral=True)
 
     log_channel = simonsays_log_channel_for(interaction.guild_id)
@@ -1332,7 +1483,7 @@ async def simon_says(interaction: discord.Interaction, text: str):
             timestamp=datetime.now(timezone.utc),
         )
         embed.add_field(name="Used by", value=interaction.user.mention, inline=True)
-        embed.add_field(name="Channel", value=interaction.channel.mention, inline=True)
+        embed.add_field(name="Message", value=f"[Jump to message]({sent_message.jump_url})", inline=True)
         try:
             await log_channel.send(embed=embed)
         except (discord.Forbidden, discord.HTTPException):
@@ -1494,6 +1645,73 @@ async def setstatus(interaction: discord.Interaction, activity_type: app_command
 async def setstatus_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
     if isinstance(error, app_commands.CheckFailure):
         await interaction.response.send_message("Only the bot's owner can change its status.", ephemeral=True)
+    else:
+        raise error
+
+
+@bot.tree.command(
+    name="setmutewhentagging",
+    description="[Bot owner only] Auto-timeout a user every time they tag someone, growing by 5s each time.",
+)
+@app_commands.describe(user="The user to watch")
+@app_commands.check(_is_owner_check)
+async def setmutewhentagging(interaction: discord.Interaction, user: discord.Member):
+    if add_tag_mute_watch(interaction.guild_id, user.id, interaction.user.id):
+        await interaction.response.send_message(
+            f"{user.mention} will now be timed out every time they tag someone in this server — 5 seconds the "
+            f"first time, growing by 5 more seconds each time after.",
+            ephemeral=True,
+        )
+    else:
+        await interaction.response.send_message(f"{user.mention} is already being watched.", ephemeral=True)
+
+
+@setmutewhentagging.error
+async def setmutewhentagging_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.CheckFailure):
+        await interaction.response.send_message("Only the bot's owner can set this up.", ephemeral=True)
+    else:
+        raise error
+
+
+@bot.tree.command(
+    name="clearmutewhentagging",
+    description="[Bot owner only] Stop auto-timing-out a user for tagging people, and reset their offense count.",
+)
+@app_commands.describe(user="The user to stop watching")
+@app_commands.check(_is_owner_check)
+async def clearmutewhentagging(interaction: discord.Interaction, user: discord.Member):
+    if remove_tag_mute_watch(interaction.guild_id, user.id):
+        await interaction.response.send_message(f"{user.mention} is no longer being watched.", ephemeral=True)
+    else:
+        await interaction.response.send_message(f"{user.mention} wasn't being watched.", ephemeral=True)
+
+
+@clearmutewhentagging.error
+async def clearmutewhentagging_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.CheckFailure):
+        await interaction.response.send_message("Only the bot's owner can do this.", ephemeral=True)
+    else:
+        raise error
+
+
+@bot.tree.command(
+    name="resetmuteoffenses",
+    description="[Bot owner only] Reset a watched user's tag-mute offense count to 0 without unwatching them.",
+)
+@app_commands.describe(user="The watched user whose offense count should be reset")
+@app_commands.check(_is_owner_check)
+async def resetmuteoffenses(interaction: discord.Interaction, user: discord.Member):
+    if reset_tag_mute_offense(interaction.guild_id, user.id):
+        await interaction.response.send_message(f"{user.mention}'s offense count has been reset to 0.", ephemeral=True)
+    else:
+        await interaction.response.send_message(f"{user.mention} isn't being watched.", ephemeral=True)
+
+
+@resetmuteoffenses.error
+async def resetmuteoffenses_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.CheckFailure):
+        await interaction.response.send_message("Only the bot's owner can do this.", ephemeral=True)
     else:
         raise error
 
@@ -1849,6 +2067,7 @@ class QuoteListView(discord.ui.View):
 
 
 q_help_cooldown = commands.CooldownMapping.from_cooldown(1, 300, commands.BucketType.user)
+quote_zero_cooldown = commands.CooldownMapping.from_cooldown(1, 3600, commands.BucketType.user)
 
 
 @bot.command(name="q", aliases=["quote"])
@@ -1924,11 +2143,12 @@ async def quote_prefix(ctx: commands.Context, *, target: str = None):
         if row is None:
             await ctx.send(f"There's no quote #{number} in this server.")
             return
-        if row["saved_by_id"] != ctx.author.id and not ctx.author.guild_permissions.manage_messages:
-            await ctx.send(f"You can only delete quotes you added yourself — quote #{number} was added by someone else.")
+        is_involved = ctx.author.id in (row["saved_by_id"], row["author_id"])
+        if not is_involved and not ctx.author.guild_permissions.manage_messages:
+            await ctx.send(f"You can only delete quotes you added or that quote you — quote #{number} is neither.")
             return
         delete_quote(ctx.guild.id, number)
-        await ctx.send(f"Deleted quote #{number}.")
+        await ctx.send(f"Deleted quote #{number}. Later quotes have been renumbered to close the gap.")
         return
 
     if not target:
@@ -1942,7 +2162,8 @@ async def quote_prefix(ctx: commands.Context, *, target: str = None):
     cleaned = target.lstrip("#")
     if cleaned.isdigit():
         if int(cleaned) == 0 and ctx.author.id == 252159829970386944:
-            await ctx.send("Iamus, please stop torturing me. There isn't a quote 0.")
+            if not quote_zero_cooldown.update_rate_limit(ctx.message):
+                await ctx.send("Iamus, please stop torturing me. There isn't a quote 0.")
             return
         row, error = resolve_quote(ctx.guild.id, number=int(cleaned))
         if row is None:
@@ -1997,7 +2218,7 @@ async def quotes_list(interaction: discord.Interaction, user: discord.Member = N
 @app_commands.checks.has_permissions(manage_messages=True)
 async def delquote(interaction: discord.Interaction, number: int):
     if delete_quote(interaction.guild_id, number):
-        await interaction.response.send_message(f"Deleted quote #{number}.", ephemeral=True)
+        await interaction.response.send_message(f"Deleted quote #{number}. Later quotes have been renumbered to close the gap.", ephemeral=True)
     else:
         await interaction.response.send_message(f"There's no quote #{number} in this server.", ephemeral=True)
 
@@ -2193,6 +2414,18 @@ US_STATE_CAPITALS = {
     "wisconsin": "Madison, WI", "wyoming": "Cheyenne, WY", "district of columbia": "Washington, DC",
 }
 
+# Same problem as US states: these Australian state/territory names aren't
+# populated places in the geocoder, so a bare name like "victoria" falls
+# through to an unrelated same-named city abroad (e.g. Vitória, Brazil)
+# instead of the state itself. Redirect to the state capital.
+AU_STATE_CAPITALS = {
+    "new south wales": "Sydney, NSW, Australia", "victoria": "Melbourne, VIC, Australia",
+    "queensland": "Brisbane, QLD, Australia", "western australia": "Perth, WA, Australia",
+    "south australia": "Adelaide, SA, Australia", "tasmania": "Hobart, TAS, Australia",
+    "northern territory": "Darwin, NT, Australia",
+    "australian capital territory": "Canberra, ACT, Australia",
+}
+
 
 async def geocode_location(query: str):
     """Resolves free-text like 'Austin, TX' to (display_name, lat, lon,
@@ -2203,14 +2436,14 @@ async def geocode_location(query: str):
     bare state name (e.g. 'Texas') would otherwise match on an obscure
     alternate name for an unrelated small town. Those are redirected to the
     state capital instead."""
-    capital = US_STATE_CAPITALS.get(query.strip().lower())
+    capital = US_STATE_CAPITALS.get(query.strip().lower()) or AU_STATE_CAPITALS.get(query.strip().lower())
     if capital:
         query = capital
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(
                 "https://geocoding-api.open-meteo.com/v1/search",
-                params={"name": query, "count": "1", "language": "en", "format": "json"},
+                params={"name": query, "count": "10", "language": "en", "format": "json"},
                 timeout=aiohttp.ClientTimeout(total=10),
             ) as resp:
                 if resp.status != 200:
@@ -2223,7 +2456,12 @@ async def geocode_location(query: str):
     if not results:
         return None
 
-    place = results[0]
+    # Open-Meteo ranks results by its own popularity/relevance score, which
+    # can bury an exact name match (e.g. "Paris" -> a small town) behind a
+    # more "important" partial match. Prefer an exact (case-insensitive)
+    # match on the place name, falling back to the API's top result.
+    query_name = query.split(",")[0].strip().lower()
+    place = next((r for r in results if r.get("name", "").lower() == query_name), results[0])
     parts = [place["name"]]
     if place.get("admin1"):
         parts.append(place["admin1"])
@@ -2235,6 +2473,7 @@ async def geocode_location(query: str):
 
 
 ZIP_CODE_RE = re.compile(r"^(\d{5})(?:-\d{4})?$")
+MENTION_RE = re.compile(r"<@[!&]?\d+>")
 
 
 async def geocode_zip(zip_code: str):
@@ -2407,7 +2646,11 @@ async def weather_prefix(ctx: commands.Context, *, location: str = None):
     .w <location> -> forecast for a specific city or 5-digit US ZIP,
     without changing your saved location"""
     if location:
-        location = location.strip()
+        # Tagging a user (accidentally or as a joke, e.g. ".w @Bob") isn't a
+        # location — strip mentions out and fall back to the saved location
+        # if nothing but a mention was given.
+        location = MENTION_RE.sub("", location).strip()
+    if location:
         zip_match = ZIP_CODE_RE.match(location)
         resolved = await geocode_zip(zip_match.group(1)) if zip_match else await geocode_location(location)
         if resolved is None:
@@ -2432,6 +2675,58 @@ async def weather_prefix(ctx: commands.Context, *, location: str = None):
         return
 
     await ctx.send(format_forecast_message(display_name, forecast, is_us, wind_speed_unit))
+
+
+# Wikimedia's API rejects requests with no (or a generic) User-Agent —
+# https://w.wiki/4wJS — so identify ourselves per their robot policy.
+WIKI_USER_AGENT = "PoohBot/1.0 (https://github.com/CJWTX/PoohBot)"
+
+
+async def fetch_wikipedia_url(query: str):
+    """Searches English Wikipedia for `query` and returns the URL of the top
+    result, or None if nothing matched or the request failed."""
+    headers = {"User-Agent": WIKI_USER_AGENT}
+    try:
+        async with aiohttp.ClientSession(headers=headers) as session:
+            async with session.get(
+                "https://en.wikipedia.org/w/api.php",
+                params={
+                    "action": "query",
+                    "list": "search",
+                    "srsearch": query,
+                    "srlimit": 1,
+                    "format": "json",
+                },
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                if resp.status != 200:
+                    return None
+                search_data = await resp.json()
+    except (aiohttp.ClientError, TimeoutError):
+        return None
+
+    results = (search_data.get("query") or {}).get("search") or []
+    if not results:
+        return None
+    title = results[0]["title"].replace(" ", "_")
+    return f"https://en.wikipedia.org/wiki/{url_quote(title)}"
+
+
+@bot.command(name="wiki", aliases=["wikipedia"])
+async def wikipedia_prefix(ctx: commands.Context, *, topic: str = None):
+    """.wiki <topic> -> posts the link to the top Wikipedia result for that topic"""
+    if not topic:
+        await ctx.send("Usage: `.wiki <topic>`")
+        return
+
+    async with ctx.typing():
+        url = await fetch_wikipedia_url(topic)
+
+    if url is None:
+        await ctx.send(f"Couldn't find a Wikipedia article for **{topic}**.")
+        return
+
+    await ctx.send(url)
 
 
 @bot.event
@@ -2500,6 +2795,15 @@ async def handle_quote_save(payload: discord.RawReactionActionEvent, guild: disc
         channel = guild.get_channel(payload.channel_id) or await guild.fetch_channel(payload.channel_id)
         message = await channel.fetch_message(payload.message_id)
     except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+        return
+
+    if message.author.id == payload.user_id:
+        reactor = payload.member or guild.get_member(payload.user_id)
+        mention = reactor.mention if reactor else f"<@{payload.user_id}>"
+        try:
+            await channel.send(f"{mention} slow down narcissist, you cant quote yourself", reference=message, mention_author=False)
+        except (discord.Forbidden, discord.HTTPException):
+            pass
         return
 
     if message.webhook_id is not None:
@@ -2617,6 +2921,7 @@ async def on_message(message: discord.Message):
         return
     if message.guild is not None:  # everything past this point only handles DMs
         await maybe_reply_good_bot(message)
+        await maybe_tag_mute(message)
         await bot.process_commands(message)
         return
 
@@ -2664,6 +2969,11 @@ async def apply_saved_status():
     await bot.change_presence(activity=discord.Activity(type=activity_type, name=text))
 
 
+@tasks.loop(time=dt_time(hour=0, minute=0, tzinfo=timezone.utc))
+async def reset_tag_mute_offenses_daily():
+    reset_all_tag_mute_offenses()
+
+
 # ---------- lifecycle ----------
 
 @bot.event
@@ -2671,6 +2981,9 @@ async def on_ready():
     bot.add_view(ReportActionView())  # re-register persistent buttons after a restart
     bot.add_view(PinRequestView())
     await apply_saved_status()
+
+    if not reset_tag_mute_offenses_daily.is_running():
+        reset_tag_mute_offenses_daily.start()
 
     test_guild_id = os.environ.get("TEST_GUILD_ID")
     if test_guild_id:
