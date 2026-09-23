@@ -34,8 +34,8 @@ FEATURES
   - /setmutewhentagging, /clearmutewhentagging, /resetmuteoffenses - [bot
     owner only] put a user on a per-server watch list that auto-times them
     out every time they tag someone; the timeout grows by 5 seconds per
-    offense (5s, 10s, 15s, ...), with everyone's offense count resetting
-    daily at midnight UTC (or on demand with /resetmuteoffenses). Requires
+    offense (5s, 10s, 15s, ...) — change the base with /setmutetimeout — with everyone's offense count resetting
+    daily at midnight US Central time (or on demand with /resetmuteoffenses). Requires
     the "Moderate Members" permission.
 
 SETUP
@@ -67,6 +67,7 @@ import sqlite3
 import time
 from datetime import datetime, timedelta, timezone
 from datetime import time as dt_time
+from zoneinfo import ZoneInfo
 from urllib.parse import quote as url_quote
 
 import aiohttp
@@ -190,6 +191,16 @@ def init_db():
             added_by_id INTEGER,
             created_at TEXT,
             PRIMARY KEY (guild_id, webhook_id)
+        )"""
+    )
+    # Messages whose author already got the "can't quote yourself" reply, so
+    # repeat self-reactions on the same message don't re-trigger it.
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS self_quote_attempts (
+            guild_id INTEGER,
+            message_id INTEGER,
+            created_at TEXT,
+            PRIMARY KEY (guild_id, message_id)
         )"""
     )
     # A user's saved location for .w — one per user, independent of server.
@@ -398,6 +409,19 @@ def is_no_quote_webhook(guild_id: int, webhook_id: int) -> bool:
     ).fetchone()
     conn.close()
     return row is not None
+
+
+def record_self_quote_attempt(guild_id: int, message_id: int) -> bool:
+    """Returns True the first time a self-quote is attempted on this message,
+    False on every later attempt."""
+    conn = db_connect()
+    cur = conn.execute(
+        "INSERT OR IGNORE INTO self_quote_attempts (guild_id, message_id, created_at) VALUES (?, ?, ?)",
+        (guild_id, message_id, datetime.now(timezone.utc).isoformat()),
+    )
+    conn.commit()
+    conn.close()
+    return cur.rowcount == 1
 
 
 def set_user_location(user_id: int, location_name: str, latitude: float, longitude: float, tz_name: str, is_us: bool):
@@ -893,8 +917,16 @@ async def maybe_reply_good_bot(message: discord.Message):
 
 # ---------- tag-mute watch list ----------
 
-TAG_MUTE_SECONDS_PER_OFFENSE = 5
+TAG_MUTE_SECONDS_PER_OFFENSE = 5  # default; the bot owner can change it with /setmutetimeout
 TAG_MUTE_CAP_SECONDS = 40320 * 60  # Discord's timeout cap is 28 days
+
+
+def tag_mute_seconds_per_offense() -> int:
+    """The base tag-mute timeout, applies across all servers."""
+    try:
+        return int(get_setting("tag_mute_seconds_per_offense", TAG_MUTE_SECONDS_PER_OFFENSE))
+    except (TypeError, ValueError):
+        return TAG_MUTE_SECONDS_PER_OFFENSE
 
 # Matches an explicit user mention typed into the message content, e.g.
 # "<@123>" or "<@!123>". Deliberately narrower than message.mentions, which
@@ -907,8 +939,8 @@ USER_MENTION_RE = re.compile(r"<@!?(\d+)>")
 async def maybe_tag_mute(message: discord.Message):
     """If the message author is on the guild's tag-mute watch list and just
     tagged someone else (an explicit @mention, not just a reply, and not the
-    bot itself), times them out — 5 seconds the first time, growing by 5
-    more seconds on every offense after that."""
+    bot itself), times them out — the base timeout (5 seconds by default)
+    the first time, growing by that much again on every offense after that."""
     if message.guild is None or not isinstance(message.author, discord.Member):
         return
     if not is_tag_mute_watched(message.guild.id, message.author.id):
@@ -922,7 +954,7 @@ async def maybe_tag_mute(message: discord.Message):
         return
 
     offense_count = bump_tag_mute_offense(message.guild.id, message.author.id)
-    seconds = min(offense_count * TAG_MUTE_SECONDS_PER_OFFENSE, TAG_MUTE_CAP_SECONDS)
+    seconds = min(offense_count * tag_mute_seconds_per_offense(), TAG_MUTE_CAP_SECONDS)
     try:
         await message.author.timeout(
             discord.utils.utcnow() + timedelta(seconds=seconds),
@@ -1651,15 +1683,16 @@ async def setstatus_error(interaction: discord.Interaction, error: app_commands.
 
 @bot.tree.command(
     name="setmutewhentagging",
-    description="[Bot owner only] Auto-timeout a user every time they tag someone, growing by 5s each time.",
+    description="[Bot owner only] Auto-timeout a user every time they tag someone, growing each time.",
 )
 @app_commands.describe(user="The user to watch")
 @app_commands.check(_is_owner_check)
 async def setmutewhentagging(interaction: discord.Interaction, user: discord.Member):
     if add_tag_mute_watch(interaction.guild_id, user.id, interaction.user.id):
+        base = tag_mute_seconds_per_offense()
         await interaction.response.send_message(
-            f"{user.mention} will now be timed out every time they tag someone in this server — 5 seconds the "
-            f"first time, growing by 5 more seconds each time after.",
+            f"{user.mention} will now be timed out every time they tag someone in this server — {base} second(s) "
+            f"the first time, growing by {base} more second(s) each time after.",
             ephemeral=True,
         )
     else:
@@ -1710,6 +1743,29 @@ async def resetmuteoffenses(interaction: discord.Interaction, user: discord.Memb
 
 @resetmuteoffenses.error
 async def resetmuteoffenses_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.CheckFailure):
+        await interaction.response.send_message("Only the bot's owner can do this.", ephemeral=True)
+    else:
+        raise error
+
+
+@bot.tree.command(
+    name="setmutetimeout",
+    description="[Bot owner only] Set the base tag-mute timeout (applies across all servers).",
+)
+@app_commands.describe(seconds="Seconds for the first offense; each later offense adds this much again")
+@app_commands.check(_is_owner_check)
+async def setmutetimeout(interaction: discord.Interaction, seconds: app_commands.Range[int, 1, TAG_MUTE_CAP_SECONDS]):
+    set_setting("tag_mute_seconds_per_offense", str(seconds))
+    await interaction.response.send_message(
+        f"Tag-mute timeout is now {seconds} second(s) for the first offense, growing by {seconds} more "
+        f"second(s) each time after.",
+        ephemeral=True,
+    )
+
+
+@setmutetimeout.error
+async def setmutetimeout_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
     if isinstance(error, app_commands.CheckFailure):
         await interaction.response.send_message("Only the bot's owner can do this.", ephemeral=True)
     else:
@@ -2798,6 +2854,8 @@ async def handle_quote_save(payload: discord.RawReactionActionEvent, guild: disc
         return
 
     if message.author.id == payload.user_id:
+        if not record_self_quote_attempt(payload.guild_id, payload.message_id):
+            return  # already called them out on this message
         reactor = payload.member or guild.get_member(payload.user_id)
         mention = reactor.mention if reactor else f"<@{payload.user_id}>"
         try:
@@ -2851,16 +2909,12 @@ async def handle_quote_save(payload: discord.RawReactionActionEvent, guild: disc
         message_created_at=message.created_at.isoformat(),
         created_at=datetime.now(timezone.utc).isoformat(),
     )
-    if quote_number is None:
-        return  # couldn't allocate a number; nothing useful to say
+    if quote_number is None or not created:
+        return  # couldn't allocate a number, or already quoted — stay quiet
 
     saver = payload.member or guild.get_member(payload.user_id)
     saver_name = saver.display_name if saver else "someone"
-    note = (
-        f"New quote added by {saver_name} as #{quote_number} {message.jump_url}"
-        if created
-        else f"💬 That's already **quote #{quote_number}** — recall it with `.q {quote_number}`\n{message.jump_url}"
-    )
+    note = f"New quote added by {saver_name} as #{quote_number} {message.jump_url}"
     try:
         await channel.send(note, reference=message, mention_author=False)
     except (discord.Forbidden, discord.HTTPException):
@@ -2969,7 +3023,7 @@ async def apply_saved_status():
     await bot.change_presence(activity=discord.Activity(type=activity_type, name=text))
 
 
-@tasks.loop(time=dt_time(hour=0, minute=0, tzinfo=timezone.utc))
+@tasks.loop(time=dt_time(hour=0, minute=0, tzinfo=ZoneInfo("America/Chicago")))
 async def reset_tag_mute_offenses_daily():
     reset_all_tag_mute_offenses()
 
