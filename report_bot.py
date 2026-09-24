@@ -1177,19 +1177,20 @@ USER_MENTION_RE = re.compile(r"<@!?(\d+)>")
 
 async def maybe_tag_mute(message: discord.Message):
     """If the message author is on the guild's tag-mute watch list and just
-    tagged someone else (an explicit @mention, not just a reply, and not the
-    bot itself), times them out — the base timeout (5 seconds by default)
-    the first time, growing by that much again on every offense after that."""
+    tagged someone else (an explicit @mention, not just a reply, and not a
+    bot), times them out — the base timeout (5 seconds by default) the
+    first time, growing by that much again on every offense after that.
+    Any message that tags this bot is let off entirely, even if it tags
+    other people too."""
     if message.guild is None or not isinstance(message.author, discord.Member):
         return
     if not is_tag_mute_watched(message.guild.id, message.author.id):
         return
 
     mentioned_ids = {int(uid) for uid in USER_MENTION_RE.findall(message.content or "")}
-    # Pinging the bot itself (e.g. to use a feature) is always allowed.
-    exempt_ids = {message.author.id, bot.user.id}
-    tagged_someone_else = any(uid not in exempt_ids for uid in mentioned_ids)
-    if not tagged_someone_else:
+    if bot.user.id in mentioned_ids:
+        return
+    if not ping_targets(message):
         return
 
     offense_count = bump_tag_mute_offense(message.guild.id, message.author.id)
