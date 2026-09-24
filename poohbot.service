@@ -1,0 +1,19 @@
+[Unit]
+Description=Discord Report Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=cjwitmer
+WorkingDirectory=/home/cjwitmer/Poohbot
+EnvironmentFile=/home/cjwitmer/Poohbot/token.env
+# Write print() output straight to the journal instead of holding it back
+# (buffered output is lost when systemd stops the bot).
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/cjwitmer/Poohbot/venv/bin/python /home/cjwitmer/Poohbot/report_bot.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

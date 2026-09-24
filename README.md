@@ -207,7 +207,15 @@ main report channel if left unset.
    Everything else works with sensible defaults from there.
 
 For always-on hosting, run it under a process manager like `systemd` so it
-restarts automatically and survives reboots.
+restarts automatically and survives reboots. `poohbot.service` is the unit
+used in production: it loads secrets from `token.env` (not committed) and
+sets `PYTHONUNBUFFERED=1` so the bot's log lines reach the journal. Adjust
+the user and paths, then:
+```bash
+sudo cp poohbot.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now poohbot
+```
 
 ## Data
 
