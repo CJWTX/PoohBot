@@ -662,16 +662,23 @@ def get_ping_back_queue(guild_id: int, user_id: int = None):
     return rows
 
 
-def pop_due_ping_backs(now: datetime):
-    """Removes and returns every queued ping whose time has come."""
+def get_due_ping_backs(now: datetime):
+    """Every queued ping whose time has come, oldest first. They stay queued
+    until delete_queued_ping_back() is called, so a failed send is retried."""
     conn = db_connect()
     rows = conn.execute(
-        "SELECT * FROM ping_back_queue WHERE fire_at <= ?", (now.isoformat(timespec="microseconds"),)
+        "SELECT * FROM ping_back_queue WHERE fire_at <= ? ORDER BY fire_at",
+        (now.isoformat(timespec="microseconds"),),
     ).fetchall()
-    conn.executemany("DELETE FROM ping_back_queue WHERE id = ?", [(row["id"],) for row in rows])
-    conn.commit()
     conn.close()
     return rows
+
+
+def delete_queued_ping_back(queue_id: int):
+    conn = db_connect()
+    conn.execute("DELETE FROM ping_back_queue WHERE id = ?", (queue_id,))
+    conn.commit()
+    conn.close()
 
 
 def set_ping_back_role(guild_id: int, role_id: int | None):
@@ -3978,34 +3985,72 @@ async def reset_tag_mute_offenses_daily():
     reset_all_tag_mute_offenses()
 
 
+# Errors that mean "can't reach Discord right now" rather than "this ping-back
+# can never be sent" — the ping-back stays queued and is retried.
+_NETWORK_ERRORS = (aiohttp.ClientError, OSError, asyncio.TimeoutError)
+# A ping-back whose server the bot can't see gets retried for this long (in
+# case it's mid-reconnect) before being given up on.
+PING_BACK_MAX_OVERDUE = timedelta(days=7)
+
+
+def _is_temporary_http_error(error: discord.HTTPException) -> bool:
+    return error.status == 429 or error.status >= 500
+
+
 @tasks.loop(seconds=30)
 async def send_due_ping_backs():
-    for row in pop_due_ping_backs(discord.utils.utcnow()):
-        guild = bot.get_guild(row["guild_id"])
-        if guild is None:
-            continue
-        member = guild.get_member(row["user_id"])
-        if member is None:
-            try:
-                member = await guild.fetch_member(row["user_id"])
-            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-                continue  # left the server — drop it
-        channels = _ping_back_channels(guild, member)
-        phrases = get_ping_back_phrases(guild.id)
-        if not channels or not phrases:
-            continue
-        channel = random.choice(channels)
-        text = format_ping_back_phrase(random.choice(phrases)["phrase"], member.mention)
+    if not bot.is_ready():
+        return  # still connecting/reconnecting — everything due just waits
+    now = discord.utils.utcnow()
+    for row in get_due_ping_backs(now):
+        result = await _send_ping_back(row, now)
+        if result == "network_down":
+            return  # leave this and everything after it queued for the next tick
+        if result != "retry":
+            delete_queued_ping_back(row["id"])
+
+
+async def _send_ping_back(row, now: datetime) -> str:
+    """Tries to send one queued ping-back. Returns "sent", "dropped" (can
+    never be sent, e.g. they left), "retry" (try again next tick) or
+    "network_down" (Discord unreachable; stop for this tick)."""
+    guild = bot.get_guild(row["guild_id"])
+    if guild is None:
+        overdue = now - datetime.fromisoformat(row["fire_at"])
+        return "dropped" if overdue > PING_BACK_MAX_OVERDUE else "retry"
+
+    member = guild.get_member(row["user_id"])
+    if member is None:
         try:
-            sent_message = await channel.send(
-                text,
-                # Phrases are user-written, so never let one ping @everyone or a role.
-                allowed_mentions=discord.AllowedMentions(everyone=False, roles=False, users=True),
-            )
-        except (discord.Forbidden, discord.HTTPException):
-            continue
-        print(f"[ping-back] {guild.name}: pinged {member} ({member.id}) in #{channel.name}: {text}")
-        await log_ping_back(guild, member, sent_message, text)
+            member = await guild.fetch_member(row["user_id"])
+        except (discord.NotFound, discord.Forbidden):
+            return "dropped"  # left the server
+        except discord.HTTPException as e:
+            return "retry" if _is_temporary_http_error(e) else "dropped"
+        except _NETWORK_ERRORS:
+            return "network_down"
+
+    channels = _ping_back_channels(guild, member)
+    phrases = get_ping_back_phrases(guild.id)
+    if not channels or not phrases:
+        return "dropped"
+    channel = random.choice(channels)
+    text = format_ping_back_phrase(random.choice(phrases)["phrase"], member.mention)
+    try:
+        sent_message = await channel.send(
+            text,
+            # Phrases are user-written, so never let one ping @everyone or a role.
+            allowed_mentions=discord.AllowedMentions(everyone=False, roles=False, users=True),
+        )
+    except discord.Forbidden:
+        return "dropped"
+    except discord.HTTPException as e:
+        return "retry" if _is_temporary_http_error(e) else "dropped"
+    except _NETWORK_ERRORS:
+        return "network_down"
+    print(f"[ping-back] {guild.name}: pinged {member} ({member.id}) in #{channel.name}: {text}")
+    await log_ping_back(guild, member, sent_message, text)
+    return "sent"
 
 
 async def log_ping_back(guild: discord.Guild, member: discord.Member, sent_message: discord.Message, text: str):
