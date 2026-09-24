@@ -280,6 +280,7 @@ def init_db():
     _migrate_add_column("guild_config", "simonsays_log_channel_id", "INTEGER")
     _migrate_add_column("guild_config", "no_quote_role_id", "INTEGER")
     _migrate_add_column("guild_config", "ping_back_role_id", "INTEGER")
+    _migrate_add_column("guild_config", "ping_back_log_channel_id", "INTEGER")
     _migrate_add_column("ping_counts", "target_is_role", "INTEGER NOT NULL DEFAULT 0")
     _migrate_add_column("user_locations", "is_us", "INTEGER")
     _migrate_add_column("user_locations", "wind_speed_unit", "TEXT")
@@ -645,6 +646,21 @@ def queue_ping_backs(guild_id: int, user_id: int, fire_times: list[datetime]):
     conn.close()
 
 
+def get_ping_back_queue(guild_id: int, user_id: int = None):
+    """Queued ping-backs for the server (or one user), soonest first."""
+    conn = db_connect()
+    if user_id is None:
+        rows = conn.execute(
+            "SELECT * FROM ping_back_queue WHERE guild_id = ? ORDER BY fire_at", (guild_id,)
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM ping_back_queue WHERE guild_id = ? AND user_id = ? ORDER BY fire_at", (guild_id, user_id)
+        ).fetchall()
+    conn.close()
+    return rows
+
+
 def pop_due_ping_backs(now: datetime):
     """Removes and returns every queued ping whose time has come."""
     conn = db_connect()
@@ -663,6 +679,17 @@ def set_ping_back_role(guild_id: int, role_id: int | None):
         "INSERT INTO guild_config (guild_id, ping_back_role_id) VALUES (?, ?) "
         "ON CONFLICT(guild_id) DO UPDATE SET ping_back_role_id = excluded.ping_back_role_id",
         (guild_id, role_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def set_ping_back_log_channel(guild_id: int, channel_id: int | None):
+    conn = db_connect()
+    conn.execute(
+        "INSERT INTO guild_config (guild_id, ping_back_log_channel_id) VALUES (?, ?) "
+        "ON CONFLICT(guild_id) DO UPDATE SET ping_back_log_channel_id = excluded.ping_back_log_channel_id",
+        (guild_id, channel_id),
     )
     conn.commit()
     conn.close()
@@ -1381,6 +1408,14 @@ def no_quote_role_id_for(guild_id: int):
     if row is None:
         return None
     return row["no_quote_role_id"]
+
+
+def ping_back_log_channel_for(guild_id: int):
+    """The configured ping-back log channel, or None (logging is opt-in)."""
+    row = get_config(guild_id)
+    if row is None or row["ping_back_log_channel_id"] is None:
+        return None
+    return bot.get_channel(row["ping_back_log_channel_id"])
 
 
 def simonsays_log_channel_for(guild_id: int):
@@ -2338,6 +2373,20 @@ async def setpingbackrole_error(interaction: discord.Interaction, error: app_com
 
 
 @bot.tree.command(
+    name="setpingbacklogchannel",
+    description="Set a channel to log every ping-back the bot sends. Leave empty to stop logging.",
+)
+@app_commands.describe(channel="The channel to log ping-backs to (leave empty to turn logging off)")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def setpingbacklogchannel(interaction: discord.Interaction, channel: discord.TextChannel = None):
+    set_ping_back_log_channel(interaction.guild_id, channel.id if channel else None)
+    if channel:
+        await interaction.response.send_message(f"Ping-backs will now be logged to {channel.mention}.", ephemeral=True)
+    else:
+        await interaction.response.send_message("Ping-back logging turned off.", ephemeral=True)
+
+
+@bot.tree.command(
     name="setpingback",
     description="Every time a user tags someone, ping them twice at random times and places.",
 )
@@ -2368,6 +2417,39 @@ async def clearpingback(interaction: discord.Interaction, user: discord.Member):
         )
     else:
         await interaction.response.send_message(f"{user.mention} wasn't on the ping-back list.", ephemeral=True)
+
+
+@bot.tree.command(name="pingbackqueue", description="See the ping-backs that are queued up and when they'll go out.")
+@app_commands.describe(user="Only show ping-backs queued for this user")
+@app_commands.checks.has_permissions(manage_messages=True)
+async def pingbackqueue(interaction: discord.Interaction, user: discord.Member = None):
+    rows = get_ping_back_queue(interaction.guild_id, user.id if user else None)
+    if not rows:
+        await interaction.response.send_message(
+            f"No ping-backs queued for {user.mention}." if user else "No ping-backs are queued.", ephemeral=True
+        )
+        return
+
+    by_user: dict[int, list[int]] = {}
+    for row in rows:
+        by_user.setdefault(row["user_id"], []).append(int(datetime.fromisoformat(row["fire_at"]).timestamp()))
+
+    # Discord renders <t:...> in each viewer's own time zone; :R adds "in 2 hours".
+    lines = []
+    for user_id, times in by_user.items():
+        lines.append(f"<@{user_id}> — {len(times)} queued")
+        lines.extend(f"• <t:{t}:f> (<t:{t}:R>)" for t in times)
+        lines.append("")
+    description = ""
+    for i, line in enumerate(lines):
+        if len(description) + len(line) > 3900:
+            description += f"*…and {sum(1 for l in lines[i:] if l.startswith('•'))} more not shown.*"
+            break
+        description += line + "\n"
+    embed = discord.Embed(
+        title=f"Queued ping-backs ({len(rows)})", description=description.strip(), color=discord.Color.blurple()
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 @bot.tree.command(
@@ -3522,6 +3604,8 @@ setnoquoterole.error(_permission_error)
 toggle_no_quote_webhook.error(_permission_error)
 setpingback.error(_permission_error)
 clearpingback.error(_permission_error)
+setpingbacklogchannel.error(_permission_error)
+pingbackqueue.error(_permission_error)
 
 
 def _let_owner_bypass_checks():
@@ -3777,14 +3861,37 @@ async def send_due_ping_backs():
         phrases = get_ping_back_phrases(guild.id)
         if not channels or not phrases:
             continue
+        channel = random.choice(channels)
+        text = format_ping_back_phrase(random.choice(phrases)["phrase"], member.mention)
         try:
-            await random.choice(channels).send(
-                format_ping_back_phrase(random.choice(phrases)["phrase"], member.mention),
+            sent_message = await channel.send(
+                text,
                 # Phrases are user-written, so never let one ping @everyone or a role.
                 allowed_mentions=discord.AllowedMentions(everyone=False, roles=False, users=True),
             )
         except (discord.Forbidden, discord.HTTPException):
-            pass
+            continue
+        print(f"[ping-back] {guild.name}: pinged {member} ({member.id}) in #{channel.name}: {text}")
+        await log_ping_back(guild, member, sent_message, text)
+
+
+async def log_ping_back(guild: discord.Guild, member: discord.Member, sent_message: discord.Message, text: str):
+    log_channel = ping_back_log_channel_for(guild.id)
+    if log_channel is None:
+        return
+    embed = discord.Embed(
+        title="🏓 Ping-back sent",
+        description=text,
+        color=discord.Color.blurple(),
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.add_field(name="Pinged", value=member.mention, inline=True)
+    embed.add_field(name="Where", value=f"{sent_message.channel.mention} ([Jump]({sent_message.jump_url}))", inline=True)
+    try:
+        # The log shouldn't ping them a second time.
+        await log_channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+    except (discord.Forbidden, discord.HTTPException):
+        pass  # logging is best-effort
 
 
 # ---------- lifecycle ----------
