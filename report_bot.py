@@ -788,6 +788,15 @@ def create_quote(**fields):
         conn.close()
 
 
+def is_message_quoted(guild_id: int, message_id: int) -> bool:
+    conn = db_connect()
+    row = conn.execute(
+        "SELECT 1 FROM quotes WHERE guild_id = ? AND message_id = ?", (guild_id, message_id)
+    ).fetchone()
+    conn.close()
+    return row is not None
+
+
 def get_quote(guild_id: int, quote_number: int):
     conn = db_connect()
     row = conn.execute(
@@ -2854,6 +2863,8 @@ async def handle_quote_save(payload: discord.RawReactionActionEvent, guild: disc
         return
 
     if message.author.id == payload.user_id:
+        if is_message_quoted(payload.guild_id, payload.message_id):
+            return  # someone else already quoted it — reacting along is fine
         if not record_self_quote_attempt(payload.guild_id, payload.message_id):
             return  # already called them out on this message
         reactor = payload.member or guild.get_member(payload.user_id)
