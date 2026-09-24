@@ -60,11 +60,14 @@ All mod-only buttons/commands require the "Manage Messages" (or,
 for server config, "Manage Server") permission on the person clicking.
 """
 
+import asyncio
 import os
 import random
 import re
 import sqlite3
 import time
+import traceback
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 from datetime import time as dt_time
 from zoneinfo import ZoneInfo
@@ -227,6 +230,47 @@ def init_db():
             PRIMARY KEY (guild_id, user_id)
         )"""
     )
+    # Users the bot owner has designated to get pinged back: every message
+    # where they tag someone queues two pings of their own, each at a random
+    # time in a random channel they can see.
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS ping_back_watch (
+            guild_id INTEGER,
+            user_id INTEGER,
+            added_by_id INTEGER,
+            created_at TEXT,
+            PRIMARY KEY (guild_id, user_id)
+        )"""
+    )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS ping_back_queue (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            guild_id INTEGER,
+            user_id INTEGER,
+            fire_at TEXT
+        )"""
+    )
+    # Per-server phrases for ping-backs; seeded with PING_BACK_PHRASES the
+    # first time a server needs them.
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS ping_back_phrases (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            guild_id INTEGER,
+            phrase TEXT,
+            added_by_id INTEGER
+        )"""
+    )
+    # Ping scoreboard: how many messages pinger_id has explicitly tagged
+    # target_id in (replies don't count).
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS ping_counts (
+            guild_id INTEGER,
+            pinger_id INTEGER,
+            target_id INTEGER,
+            count INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (guild_id, pinger_id, target_id)
+        )"""
+    )
     conn.commit()
     conn.close()
     _migrate_add_column("guild_config", "pin_request_channel_id", "INTEGER")
@@ -234,6 +278,7 @@ def init_db():
     _migrate_add_column("guild_config", "simonsays_role_id", "INTEGER")
     _migrate_add_column("guild_config", "simonsays_log_channel_id", "INTEGER")
     _migrate_add_column("guild_config", "no_quote_role_id", "INTEGER")
+    _migrate_add_column("guild_config", "ping_back_role_id", "INTEGER")
     _migrate_add_column("user_locations", "is_us", "INTEGER")
     _migrate_add_column("user_locations", "wind_speed_unit", "TEXT")
 
@@ -552,6 +597,191 @@ def reset_tag_mute_offense(guild_id: int, user_id: int) -> bool:
     conn.commit()
     conn.close()
     return cur.rowcount > 0
+
+
+def add_ping_back_watch(guild_id: int, user_id: int, added_by_id: int) -> bool:
+    """Returns False (no-op) if the user was already on the watch list."""
+    conn = db_connect()
+    cur = conn.execute(
+        "INSERT OR IGNORE INTO ping_back_watch (guild_id, user_id, added_by_id, created_at) VALUES (?, ?, ?, ?)",
+        (guild_id, user_id, added_by_id, datetime.now(timezone.utc).isoformat()),
+    )
+    conn.commit()
+    conn.close()
+    return cur.rowcount > 0
+
+
+def remove_ping_back_watch(guild_id: int, user_id: int) -> tuple[bool, int]:
+    """Unwatches the user and cancels their queued pings. Returns (was_watched,
+    number_of_pending_pings_cancelled)."""
+    conn = db_connect()
+    cur = conn.execute("DELETE FROM ping_back_watch WHERE guild_id = ? AND user_id = ?", (guild_id, user_id))
+    cancelled = conn.execute(
+        "DELETE FROM ping_back_queue WHERE guild_id = ? AND user_id = ?", (guild_id, user_id)
+    ).rowcount
+    conn.commit()
+    conn.close()
+    return cur.rowcount > 0, cancelled
+
+
+def is_ping_back_watched(guild_id: int, user_id: int) -> bool:
+    conn = db_connect()
+    row = conn.execute(
+        "SELECT 1 FROM ping_back_watch WHERE guild_id = ? AND user_id = ?", (guild_id, user_id)
+    ).fetchone()
+    conn.close()
+    return row is not None
+
+
+def queue_ping_backs(guild_id: int, user_id: int, fire_times: list[datetime]):
+    conn = db_connect()
+    conn.executemany(
+        "INSERT INTO ping_back_queue (guild_id, user_id, fire_at) VALUES (?, ?, ?)",
+        [(guild_id, user_id, t.isoformat(timespec="microseconds")) for t in fire_times],
+    )
+    conn.commit()
+    conn.close()
+
+
+def pop_due_ping_backs(now: datetime):
+    """Removes and returns every queued ping whose time has come."""
+    conn = db_connect()
+    rows = conn.execute(
+        "SELECT * FROM ping_back_queue WHERE fire_at <= ?", (now.isoformat(timespec="microseconds"),)
+    ).fetchall()
+    conn.executemany("DELETE FROM ping_back_queue WHERE id = ?", [(row["id"],) for row in rows])
+    conn.commit()
+    conn.close()
+    return rows
+
+
+def set_ping_back_role(guild_id: int, role_id: int | None):
+    conn = db_connect()
+    conn.execute(
+        "INSERT INTO guild_config (guild_id, ping_back_role_id) VALUES (?, ?) "
+        "ON CONFLICT(guild_id) DO UPDATE SET ping_back_role_id = excluded.ping_back_role_id",
+        (guild_id, role_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_ping_back_phrases(guild_id: int):
+    """The server's phrases, oldest first. Seeds the defaults the first time."""
+    seeded_key = f"ping_back_phrases_seeded:{guild_id}"
+    if get_setting(seeded_key) is None:
+        conn = db_connect()
+        conn.executemany(
+            "INSERT INTO ping_back_phrases (guild_id, phrase, added_by_id) VALUES (?, ?, NULL)",
+            [(guild_id, phrase) for phrase in PING_BACK_PHRASES],
+        )
+        conn.commit()
+        conn.close()
+        set_setting(seeded_key, "1")
+    conn = db_connect()
+    rows = conn.execute(
+        "SELECT * FROM ping_back_phrases WHERE guild_id = ? ORDER BY id", (guild_id,)
+    ).fetchall()
+    conn.close()
+    return rows
+
+
+def add_ping_back_phrase(guild_id: int, phrase: str, added_by_id: int) -> int:
+    """Adds a phrase and returns its number in /pingbackphrases."""
+    get_ping_back_phrases(guild_id)  # make sure the defaults exist first
+    conn = db_connect()
+    conn.execute(
+        "INSERT INTO ping_back_phrases (guild_id, phrase, added_by_id) VALUES (?, ?, ?)",
+        (guild_id, phrase, added_by_id),
+    )
+    conn.commit()
+    count = conn.execute("SELECT COUNT(*) FROM ping_back_phrases WHERE guild_id = ?", (guild_id,)).fetchone()[0]
+    conn.close()
+    return count
+
+
+def delete_ping_back_phrase(phrase_id: int):
+    conn = db_connect()
+    conn.execute("DELETE FROM ping_back_phrases WHERE id = ?", (phrase_id,))
+    conn.commit()
+    conn.close()
+
+
+def record_pings(guild_id: int, pinger_id: int, target_ids):
+    conn = db_connect()
+    conn.executemany(
+        "INSERT INTO ping_counts (guild_id, pinger_id, target_id, count) VALUES (?, ?, ?, 1) "
+        "ON CONFLICT(guild_id, pinger_id, target_id) DO UPDATE SET count = count + 1",
+        [(guild_id, pinger_id, target_id) for target_id in target_ids],
+    )
+    conn.commit()
+    conn.close()
+
+
+def clear_ping_counts(guild_id: int):
+    conn = db_connect()
+    conn.execute("DELETE FROM ping_counts WHERE guild_id = ?", (guild_id,))
+    conn.commit()
+    conn.close()
+
+
+def add_ping_counts(guild_id: int, counts: Counter):
+    """Adds {(pinger_id, target_id): n} on top of whatever is already stored."""
+    conn = db_connect()
+    conn.executemany(
+        "INSERT INTO ping_counts (guild_id, pinger_id, target_id, count) VALUES (?, ?, ?, ?) "
+        "ON CONFLICT(guild_id, pinger_id, target_id) DO UPDATE SET count = count + excluded.count",
+        [(guild_id, pinger_id, target_id, n) for (pinger_id, target_id), n in counts.items()],
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_top_pingers(guild_id: int, limit: int = 10):
+    conn = db_connect()
+    rows = conn.execute(
+        "SELECT pinger_id AS user_id, SUM(count) AS total FROM ping_counts WHERE guild_id = ? "
+        "GROUP BY pinger_id ORDER BY total DESC LIMIT ?",
+        (guild_id, limit),
+    ).fetchall()
+    conn.close()
+    return rows
+
+
+def get_top_pinged(guild_id: int, limit: int = 10):
+    conn = db_connect()
+    rows = conn.execute(
+        "SELECT target_id AS user_id, SUM(count) AS total FROM ping_counts WHERE guild_id = ? "
+        "GROUP BY target_id ORDER BY total DESC LIMIT ?",
+        (guild_id, limit),
+    ).fetchall()
+    conn.close()
+    return rows
+
+
+def get_ping_stats_for_user(guild_id: int, user_id: int, limit: int = 5) -> dict:
+    """Totals sent/received plus who this user pings most and who pings them most."""
+    conn = db_connect()
+    sent = conn.execute(
+        "SELECT COALESCE(SUM(count), 0) AS n FROM ping_counts WHERE guild_id = ? AND pinger_id = ?",
+        (guild_id, user_id),
+    ).fetchone()["n"]
+    received = conn.execute(
+        "SELECT COALESCE(SUM(count), 0) AS n FROM ping_counts WHERE guild_id = ? AND target_id = ?",
+        (guild_id, user_id),
+    ).fetchone()["n"]
+    top_targets = conn.execute(
+        "SELECT target_id AS user_id, count AS total FROM ping_counts WHERE guild_id = ? AND pinger_id = ? "
+        "ORDER BY count DESC LIMIT ?",
+        (guild_id, user_id, limit),
+    ).fetchall()
+    top_pingers = conn.execute(
+        "SELECT pinger_id AS user_id, count AS total FROM ping_counts WHERE guild_id = ? AND target_id = ? "
+        "ORDER BY count DESC LIMIT ?",
+        (guild_id, user_id, limit),
+    ).fetchall()
+    conn.close()
+    return {"sent": sent, "received": received, "top_targets": top_targets, "top_pingers": top_pingers}
 
 
 def set_simonsays_log_channel(guild_id: int, channel_id: int):
@@ -977,6 +1207,84 @@ async def maybe_tag_mute(message: discord.Message):
         pass  # missing permission / role hierarchy issue — fail silently, like other mod actions
 
 
+def ping_targets(message: discord.Message) -> set[int]:
+    """The users this message explicitly @tags, for the ping scoreboard. Each
+    tagged user counts once per message no matter how many times they're
+    tagged in it; self-tags and bots are ignored."""
+    mentioned_ids = {int(uid) for uid in USER_MENTION_RE.findall(message.content or "")}
+    bot_ids = {m.id for m in message.mentions if m.bot}
+    return mentioned_ids - bot_ids - {message.author.id, bot.user.id}
+
+
+def track_pings(message: discord.Message):
+    if message.guild is None:
+        return
+    target_ids = ping_targets(message)
+    if target_ids:
+        record_pings(message.guild.id, message.author.id, target_ids)
+
+
+# ---------- ping-back watch list ----------
+
+PING_BACKS_PER_TAG = 2
+PING_BACK_MIN_DELAY_SECONDS = 60
+PING_BACK_MAX_DELAY_SECONDS = 24 * 60 * 60
+PING_BACK_PHRASES = [
+    "hey {mention}, just wanted to say hi 👋",
+    "{mention} 👀",
+    "{mention} how does it feel?",
+    "{mention} ping 🏓",
+    "{mention} you rang?",
+    "{mention} this is your reminder that you exist",
+    "{mention} ...nevermind",
+    "{mention} tag, you're it",
+    "{mention} did you need something?",
+    "{mention} what goes around comes around",
+    "{mention} just checking in 🙂",
+    "{mention} sorry, wrong person. or was it?",
+]
+
+
+def maybe_queue_ping_backs(message: discord.Message):
+    """If the author is on the ping-back watch list and this message tags
+    someone (an explicit @mention, not a reply), queues PING_BACKS_PER_TAG
+    pings of them at random times over the next day."""
+    if message.guild is None or not is_ping_back_watched(message.guild.id, message.author.id):
+        return
+    if not ping_targets(message):
+        return
+    now = discord.utils.utcnow()
+    queue_ping_backs(
+        message.guild.id,
+        message.author.id,
+        [
+            now + timedelta(seconds=random.randint(PING_BACK_MIN_DELAY_SECONDS, PING_BACK_MAX_DELAY_SECONDS))
+            for _ in range(PING_BACKS_PER_TAG)
+        ],
+    )
+
+
+PING_BACK_PHRASE_MAX_LENGTH = 300
+
+
+def format_ping_back_phrase(phrase: str, mention: str) -> str:
+    """Puts the mention wherever {mention} appears, or at the start if it doesn't."""
+    if "{mention}" in phrase:
+        return phrase.replace("{mention}", mention)
+    return f"{mention} {phrase}"
+
+
+def _ping_back_channels(guild: discord.Guild, member: discord.Member):
+    """Text channels the member can see and the bot can post in."""
+    channels = []
+    for channel in guild.text_channels:
+        member_perms = channel.permissions_for(member)
+        bot_perms = channel.permissions_for(guild.me)
+        if member_perms.view_channel and bot_perms.view_channel and bot_perms.send_messages:
+            channels.append(channel)
+    return channels
+
+
 # ---------- bot setup ----------
 
 intents = discord.Intents.default()
@@ -987,7 +1295,15 @@ intents.message_content = True
 bot = commands.Bot(command_prefix=(".", "!"), intents=intents, case_insensitive=True)
 
 
+def is_bot_owner(user: discord.abc.User) -> bool:
+    """Sync owner check for places that can't await bot.is_owner(). Relies on
+    owner_id/owner_ids, which on_ready fills in."""
+    return user.id == bot.owner_id or user.id in (bot.owner_ids or ())
+
+
 def is_mod(interaction: discord.Interaction) -> bool:
+    if is_bot_owner(interaction.user):
+        return True
     perms = interaction.user.guild_permissions
     return perms.manage_messages or perms.manage_guild
 
@@ -1781,6 +2097,318 @@ async def setmutetimeout_error(interaction: discord.Interaction, error: app_comm
         raise error
 
 
+def _format_ping_rows(rows) -> str:
+    medals = {1: "🥇", 2: "🥈", 3: "🥉"}
+    return "\n".join(
+        f"{medals.get(i, f'`{i}.`')} <@{row['user_id']}> — {row['total']}" for i, row in enumerate(rows, start=1)
+    ) or "*nobody yet*"
+
+
+@bot.tree.command(name="pingscoreboard", description="See who tags people the most (replies don't count).")
+@app_commands.describe(user="Show one user's ping stats instead of the server leaderboard")
+async def pingscoreboard(interaction: discord.Interaction, user: discord.Member = None):
+    if user is None:
+        pingers = get_top_pingers(interaction.guild_id)
+        if not pingers:
+            await interaction.response.send_message("Nobody has tagged anyone yet.", ephemeral=True)
+            return
+        embed = discord.Embed(title=f"Ping scoreboard — {interaction.guild.name}", color=discord.Color.blurple())
+        embed.add_field(name="Top pingers", value=_format_ping_rows(pingers), inline=True)
+        embed.add_field(name="Most pinged", value=_format_ping_rows(get_top_pinged(interaction.guild_id)), inline=True)
+    else:
+        stats = get_ping_stats_for_user(interaction.guild_id, user.id)
+        embed = discord.Embed(
+            title=f"Ping stats — {user.display_name}",
+            description=f"Pinged others **{stats['sent']}** time(s) · was pinged **{stats['received']}** time(s)",
+            color=discord.Color.blurple(),
+        )
+        embed.add_field(name="Pings most", value=_format_ping_rows(stats["top_targets"]), inline=True)
+        embed.add_field(name="Pinged most by", value=_format_ping_rows(stats["top_pingers"]), inline=True)
+    embed.set_footer(text="Counts explicit @tags only — replies don't count.")
+    # Mentions inside an embed never notify anyone, so the scoreboard doesn't ping the people on it.
+    await interaction.response.send_message(embed=embed)
+
+
+_ping_backfills_running: dict[int, asyncio.Task] = {}  # guild_id -> task (also keeps the task referenced)
+
+
+async def _backfill_ping_channels(guild: discord.Guild, after: datetime | None):
+    """Yields every channel/thread in the guild whose history might hold
+    pings: text, voice and stage chats, active threads, and archived threads
+    (private ones too, when the bot can see them)."""
+    for channel in (*guild.text_channels, *guild.voice_channels, *guild.stage_channels):
+        yield channel
+    try:
+        active_threads = await guild.active_threads()
+    except (discord.Forbidden, discord.HTTPException):
+        active_threads = list(guild.threads)
+    for thread in active_threads:
+        yield thread
+
+    for parent in (*guild.text_channels, *guild.forums):
+        perms = parent.permissions_for(guild.me)
+        if not (perms.view_channel and perms.read_message_history):
+            continue
+        # Forum channels have no private threads (and no `private` argument).
+        variants = [{}]
+        if isinstance(parent, discord.TextChannel) and perms.manage_threads:
+            variants.append({"private": True})
+        for kwargs in variants:
+            try:
+                async for thread in parent.archived_threads(limit=None, **kwargs):
+                    # Newest-archived first; a thread archived before the
+                    # cutoff can't contain any messages after it.
+                    if after and thread.archive_timestamp < after:
+                        break
+                    yield thread
+            except (discord.Forbidden, discord.HTTPException):
+                continue
+
+
+async def run_ping_backfill(guild: discord.Guild, report_channel, days: int | None):
+    """Wipes the guild's ping counts and rebuilds them from message history.
+    Messages sent after the backfill starts are counted live by on_message,
+    so history is only read up to that moment to avoid double counting."""
+    clear_ping_counts(guild.id)
+    cutoff = discord.utils.utcnow()
+    after = cutoff - timedelta(days=days) if days else None
+
+    counts = Counter()
+    seen_ids = set()
+    scanned_messages = scanned_channels = skipped_channels = 0
+    error = None
+    try:
+        async for channel in _backfill_ping_channels(guild, after):
+            if channel.id in seen_ids:
+                continue
+            seen_ids.add(channel.id)
+            perms = channel.permissions_for(guild.me)
+            if not (perms.view_channel and perms.read_message_history):
+                skipped_channels += 1
+                continue
+            try:
+                async for message in channel.history(limit=None, before=cutoff, after=after, oldest_first=False):
+                    scanned_messages += 1
+                    if message.author.bot:
+                        continue
+                    for target_id in ping_targets(message):
+                        counts[(message.author.id, target_id)] += 1
+            except (discord.Forbidden, discord.HTTPException):
+                skipped_channels += 1
+                continue
+            scanned_channels += 1
+            print(f"[ping backfill] {guild.name}: #{channel.name} done ({scanned_messages} messages so far)")
+    except Exception as e:  # still save what was counted so far, then report it
+        error = e
+    finally:
+        add_ping_counts(guild.id, counts)
+        _ping_backfills_running.pop(guild.id, None)
+
+    span = f"the last {days} day(s)" if days else "all history"
+    summary = (
+        f"Scanned {scanned_messages:,} messages in {scanned_channels} channel(s)/thread(s) ({span}) "
+        f"and counted {sum(counts.values()):,} ping(s)."
+    )
+    if skipped_channels:
+        summary += f" Skipped {skipped_channels} channel(s) the bot can't read."
+    if error:
+        summary = f"⚠️ Ping backfill stopped early ({type(error).__name__}: {error}). Saved what it got: {summary}"
+    else:
+        summary = f"✅ Ping backfill finished. {summary}"
+    try:
+        await report_channel.send(summary)
+    except (discord.Forbidden, discord.HTTPException):
+        pass
+    print(f"[ping backfill] {guild.name}: {summary}")
+    if error:
+        traceback.print_exception(error)
+
+
+@bot.tree.command(
+    name="backfillpings",
+    description="[Bot owner only] Rebuild the ping scoreboard from message history. Replaces current counts.",
+)
+@app_commands.describe(days="Only count messages from the last N days (default: all history)")
+@app_commands.check(_is_owner_check)
+async def backfillpings(interaction: discord.Interaction, days: app_commands.Range[int, 1, 5000] = None):
+    if interaction.guild_id in _ping_backfills_running:
+        await interaction.response.send_message("A ping backfill is already running in this server.", ephemeral=True)
+        return
+    # Registered before the first await so a second invocation can't slip past the check above.
+    _ping_backfills_running[interaction.guild_id] = asyncio.create_task(
+        run_ping_backfill(interaction.guild, interaction.channel, days)
+    )
+    span = f"the last {days} day(s)" if days else "all message history"
+    await interaction.response.send_message(
+        f"Rebuilding the ping scoreboard from {span}. Current counts are being replaced. This can take a while "
+        f"on a big server, and I'll post here when it's done. Pings sent from now on are still counted as normal.",
+        ephemeral=True,
+    )
+
+
+@backfillpings.error
+async def backfillpings_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.CheckFailure):
+        await interaction.response.send_message("Only the bot's owner can do this.", ephemeral=True)
+    else:
+        raise error
+
+
+async def _can_use_ping_back(interaction: discord.Interaction) -> bool:
+    """The bot owner, or anyone with the server's /setpingbackrole role."""
+    if await interaction.client.is_owner(interaction.user):
+        return True
+    row = get_config(interaction.guild_id)
+    if row is not None and row["ping_back_role_id"] is not None:
+        role = interaction.guild.get_role(row["ping_back_role_id"])
+        if role is not None and role in interaction.user.roles:
+            return True
+    return False
+
+
+async def _ping_back_permission_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.CheckFailure):
+        await interaction.response.send_message(
+            "Only the bot's owner or the ping-back role can do this.", ephemeral=True
+        )
+    else:
+        raise error
+
+
+@bot.tree.command(
+    name="setpingbackrole",
+    description="[Bot owner only] Let a role manage ping-back phrases here. Leave empty to remove it.",
+)
+@app_commands.describe(role="The role allowed to use the ping-back phrase commands (leave empty to clear)")
+@app_commands.check(_is_owner_check)
+async def setpingbackrole(interaction: discord.Interaction, role: discord.Role = None):
+    set_ping_back_role(interaction.guild_id, role.id if role else None)
+    if role:
+        await interaction.response.send_message(
+            f"{role.mention} can now use the ping-back phrase commands.",
+            ephemeral=True,
+        )
+    else:
+        await interaction.response.send_message(
+            "Ping-back role cleared. Only the bot's owner can use the phrase commands now.", ephemeral=True
+        )
+
+
+@setpingbackrole.error
+async def setpingbackrole_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.CheckFailure):
+        await interaction.response.send_message("Only the bot's owner can do this.", ephemeral=True)
+    else:
+        raise error
+
+
+@bot.tree.command(
+    name="setpingback",
+    description="Every time a user tags someone, ping them twice at random times and places.",
+)
+@app_commands.describe(user="The user to watch")
+@app_commands.checks.has_permissions(manage_messages=True)
+async def setpingback(interaction: discord.Interaction, user: discord.Member):
+    if add_ping_back_watch(interaction.guild_id, user.id, interaction.user.id):
+        await interaction.response.send_message(
+            f"Every time {user.mention} tags someone in this server, they'll get pinged {PING_BACKS_PER_TAG} times "
+            f"at random times over the next day, in random channels they can see.",
+            ephemeral=True,
+        )
+    else:
+        await interaction.response.send_message(f"{user.mention} is already on the ping-back list.", ephemeral=True)
+
+
+@bot.tree.command(
+    name="clearpingback",
+    description="Stop pinging a user back, and cancel any pings still queued for them.",
+)
+@app_commands.describe(user="The user to stop watching")
+@app_commands.checks.has_permissions(manage_messages=True)
+async def clearpingback(interaction: discord.Interaction, user: discord.Member):
+    was_watched, cancelled = remove_ping_back_watch(interaction.guild_id, user.id)
+    if was_watched:
+        await interaction.response.send_message(
+            f"{user.mention} is off the ping-back list ({cancelled} queued ping(s) cancelled).", ephemeral=True
+        )
+    else:
+        await interaction.response.send_message(f"{user.mention} wasn't on the ping-back list.", ephemeral=True)
+
+
+@bot.tree.command(
+    name="addpingbackphrase",
+    description="[Owner/ping-back role] Add a ping-back phrase. Put {mention} where the tag goes.",
+)
+@app_commands.describe(phrase="e.g. \"{mention} tag, you're it\" — without {mention}, the tag goes at the start")
+@app_commands.check(_can_use_ping_back)
+async def addpingbackphrase(
+    interaction: discord.Interaction, phrase: app_commands.Range[str, 1, PING_BACK_PHRASE_MAX_LENGTH]
+):
+    number = add_ping_back_phrase(interaction.guild_id, phrase, interaction.user.id)
+    await interaction.response.send_message(
+        f"Added phrase #{number}. Preview:\n> {format_ping_back_phrase(phrase, interaction.user.mention)}",
+        ephemeral=True,
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
+@bot.tree.command(name="pingbackphrases", description="[Owner/ping-back role] List this server's ping-back phrases.")
+@app_commands.check(_can_use_ping_back)
+async def pingbackphrases(interaction: discord.Interaction):
+    rows = get_ping_back_phrases(interaction.guild_id)
+    if not rows:
+        await interaction.response.send_message(
+            "No ping-back phrases left. Add one with /addpingbackphrase, or ping-backs won't be sent.",
+            ephemeral=True,
+        )
+        return
+    lines = [f"`{i}.` {discord.utils.escape_markdown(row['phrase'])}" for i, row in enumerate(rows, start=1)]
+    # Split across several embeds if the list outgrows one embed description.
+    chunks, current = [], ""
+    for line in lines:
+        if len(current) + len(line) + 1 > 4000:
+            chunks.append(current)
+            current = ""
+        current += line + "\n"
+    chunks.append(current)
+    for i, chunk in enumerate(chunks):
+        embed = discord.Embed(
+            title="Ping-back phrases" if i == 0 else None, description=chunk, color=discord.Color.blurple()
+        )
+        if i == 0:
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+        else:
+            await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(
+    name="removepingbackphrase",
+    description="[Owner/ping-back role] Remove a ping-back phrase by its number in /pingbackphrases.",
+)
+@app_commands.describe(number="The phrase's number from /pingbackphrases")
+@app_commands.check(_can_use_ping_back)
+async def removepingbackphrase(interaction: discord.Interaction, number: app_commands.Range[int, 1]):
+    rows = get_ping_back_phrases(interaction.guild_id)
+    if number > len(rows):
+        await interaction.response.send_message(
+            f"There's no phrase #{number} (there are {len(rows)}).", ephemeral=True
+        )
+        return
+    row = rows[number - 1]
+    delete_ping_back_phrase(row["id"])
+    note = "" if len(rows) > 1 else " That was the last one, so no ping-backs will be sent until you add another."
+    await interaction.response.send_message(
+        f"Removed phrase #{number}: {discord.utils.escape_markdown(row['phrase'])}\n"
+        f"Phrases after it moved up one number.{note}",
+        ephemeral=True,
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
+for _command in (addpingbackphrase, pingbackphrases, removepingbackphrase):
+    _command.error(_ping_back_permission_error)
+
+
 async def get_or_create_dm_thread(guild: discord.Guild, user: discord.abc.User):
     """Returns (thread, error_reason). error_reason is None on success."""
     target_channel = dm_channel_for(guild.id)
@@ -2209,7 +2837,7 @@ async def quote_prefix(ctx: commands.Context, *, target: str = None):
             await ctx.send(f"There's no quote #{number} in this server.")
             return
         is_involved = ctx.author.id in (row["saved_by_id"], row["author_id"])
-        if not is_involved and not ctx.author.guild_permissions.manage_messages:
+        if not is_involved and not ctx.author.guild_permissions.manage_messages and not is_bot_owner(ctx.author):
             await ctx.send(f"You can only delete quotes you added or that quote you — quote #{number} is neither.")
             return
         delete_quote(ctx.guild.id, number)
@@ -2820,6 +3448,26 @@ setreportchannel.error(_permission_error)
 setoncallrole.error(_permission_error)
 setnoquoterole.error(_permission_error)
 toggle_no_quote_webhook.error(_permission_error)
+setpingback.error(_permission_error)
+clearpingback.error(_permission_error)
+
+
+def _let_owner_bypass_checks():
+    """The bot owner can use every slash command and context menu no matter
+    what permissions/roles the command's checks ask for."""
+    def owner_or(check):
+        async def predicate(interaction: discord.Interaction) -> bool:
+            if await interaction.client.is_owner(interaction.user):
+                return True
+            return await discord.utils.maybe_coroutine(check, interaction)
+        return predicate
+
+    for command in (*bot.tree.walk_commands(), *bot.tree.get_commands(type=discord.AppCommandType.message),
+                    *bot.tree.get_commands(type=discord.AppCommandType.user)):
+        command.checks = [owner_or(check) for check in command.checks]
+
+
+_let_owner_bypass_checks()
 setpinrequestchannel.error(_permission_error)
 setdmchannel.error(_permission_error)
 setsimonsaysrole.error(_permission_error)
@@ -2986,6 +3634,8 @@ async def on_message(message: discord.Message):
         return
     if message.guild is not None:  # everything past this point only handles DMs
         await maybe_reply_good_bot(message)
+        track_pings(message)
+        maybe_queue_ping_backs(message)
         await maybe_tag_mute(message)
         await bot.process_commands(message)
         return
@@ -3039,6 +3689,32 @@ async def reset_tag_mute_offenses_daily():
     reset_all_tag_mute_offenses()
 
 
+@tasks.loop(seconds=30)
+async def send_due_ping_backs():
+    for row in pop_due_ping_backs(discord.utils.utcnow()):
+        guild = bot.get_guild(row["guild_id"])
+        if guild is None:
+            continue
+        member = guild.get_member(row["user_id"])
+        if member is None:
+            try:
+                member = await guild.fetch_member(row["user_id"])
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                continue  # left the server — drop it
+        channels = _ping_back_channels(guild, member)
+        phrases = get_ping_back_phrases(guild.id)
+        if not channels or not phrases:
+            continue
+        try:
+            await random.choice(channels).send(
+                format_ping_back_phrase(random.choice(phrases)["phrase"], member.mention),
+                # Phrases are user-written, so never let one ping @everyone or a role.
+                allowed_mentions=discord.AllowedMentions(everyone=False, roles=False, users=True),
+            )
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+
+
 # ---------- lifecycle ----------
 
 @bot.event
@@ -3046,9 +3722,12 @@ async def on_ready():
     bot.add_view(ReportActionView())  # re-register persistent buttons after a restart
     bot.add_view(PinRequestView())
     await apply_saved_status()
+    await bot.is_owner(bot.user)  # fills in bot.owner_id/owner_ids for is_bot_owner()
 
     if not reset_tag_mute_offenses_daily.is_running():
         reset_tag_mute_offenses_daily.start()
+    if not send_due_ping_backs.is_running():
+        send_due_ping_backs.start()
 
     test_guild_id = os.environ.get("TEST_GUILD_ID")
     if test_guild_id:

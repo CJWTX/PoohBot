@@ -107,6 +107,17 @@ To add poohbot to your server: [Click this link](https://discord.com/oauth2/auth
   every use (who, what, where) to a channel with `/setsimonsayslogchannel`.
 - `/setstatus` — sets the bot's Discord activity status (bot owner only).
 
+**Ping scoreboard**
+- Every explicit @tag of another user is counted (once per user per
+  message). Replies don't count, and neither do self-tags or tags of bots.
+- `/pingscoreboard` shows the server's top pingers and most-pinged users;
+  `/pingscoreboard user:` shows who that person pings most and who pings
+  them most.
+- `/backfillpings` (bot owner) wipes the server's counts and rebuilds them
+  from message history, optionally only the last `days:`. It runs in the
+  background and posts a summary when done; live counting keeps going
+  meanwhile. Deleted messages and channels the bot can't read are missed.
+
 ## Commands
 
 | Command | Who can use it | What it does |
@@ -142,6 +153,8 @@ To add poohbot to your server: [Click this link](https://discord.com/oauth2/auth
 | `/delquote` | Manage Messages | Delete a quote by number |
 | `/defragquotes` | Manage Messages | Renumber quotes to close gaps (confirms first) |
 | `/setnoquoterole` | Manage Server | Exempt a role's members from being quoted |
+| `/pingscoreboard` / `/pingscoreboard user:` | Anyone | Leaderboard of who tags people most (and who gets tagged most), or one user's ping stats |
+| `/backfillpings` | Bot owner | Rebuild the ping scoreboard from message history (replaces current counts) |
 | **Toggle No-Quote Webhook** (right-click) | Manage Server | Exempt/un-exempt a webhook's messages from being quoted |
 
 Channel settings (`setpinrequestchannel`, `setdmchannel`) fall back to the
