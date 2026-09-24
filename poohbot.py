@@ -7,7 +7,7 @@ report channel with action buttons.
 
 FEATURES
   - Report via right-click context menu OR /report (with optional @user)
-  - Case numbers, stored in SQLite (reportbot.db, created automatically)
+  - Case numbers, stored in SQLite (poohbot.db, created automatically)
   - Duplicate detection: re-reporting the same message bumps a counter
     instead of spamming a new case
   - Auto-thread per case for mod discussion
@@ -52,7 +52,7 @@ SETUP
 3. export DISCORD_BOT_TOKEN="your-token-here"
    (optional) export TEST_GUILD_ID="your-server-id"   for instant command sync while testing
    (optional) export KLIPY_API_KEY="your-klipy-key"   required for /capybara
-4. Run: python report_bot.py
+4. Run: python poohbot.py
 5. In Discord: /setreportchannel #mod-reports and /setoncallrole @Mods
    (both require Manage Server permission), then try Report Message.
 
@@ -80,7 +80,7 @@ from discord.ext import commands, tasks
 
 # ---------- tunables ----------
 
-DB_FILE = "reportbot.db"
+DB_FILE = "poohbot.db"
 MAX_REPORTS_PER_WINDOW = 3
 RATE_LIMIT_WINDOW_SECONDS = 300  # 5 minutes
 MIN_ACCOUNT_AGE_DAYS = 1

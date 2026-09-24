@@ -61,7 +61,7 @@ To add poohbot to your server: [Click this link](https://discord.com/oauth2/auth
   with a custom name/avatar per message, since those carry no Discord role
   data for `/setnoquoterole` to check. Right-clicking again un-exempts it.
 - `import_quotes.py` (run separately, not a bot command) bulk-imports a
-  `quotes.json` export from another quote bot into `reportbot.db`.
+  `quotes.json` export from another quote bot into `poohbot.db`.
 
 **Fun extras**
 - Say "good bot" (any casing/punctuation) in a channel the bot can see and
@@ -196,7 +196,7 @@ main report channel if left unset.
 
 4. **Run it:**
    ```bash
-   python report_bot.py
+   python poohbot.py
    ```
 
 5. **Configure it in Discord** (requires Manage Server):
@@ -219,14 +219,14 @@ sudo systemctl enable --now poohbot
 
 ## Data
 
-Everything is stored in a single SQLite file, `reportbot.db`, created
+Everything is stored in a single SQLite file, `poohbot.db`, created
 automatically on first run in the working directory. No manual migration
 steps are needed when pulling updates — the bot adds any new columns/tables
 it needs on startup. This includes the `quotes` table used by the quote
 board.
 
 Migrating from another quote bot? `python3 import_quotes.py quotes.json`
-bulk-loads a JSON export into `reportbot.db`, preserving original quote
+bulk-loads a JSON export into `poohbot.db`, preserving original quote
 numbers and skipping anything already imported — see the script's docstring
 for options.
 

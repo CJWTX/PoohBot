@@ -1,10 +1,10 @@
 """
 One-off importer: loads quotes from an old bot's quotes.json export into
-report_bot.py's SQLite database (reportbot.db), preserving the original
+poohbot.py's SQLite database (poohbot.db), preserving the original
 quote numbers so existing ".q <n>" references keep working.
 
 Usage:
-    python3 import_quotes.py quotes.json [--db reportbot.db]
+    python3 import_quotes.py quotes.json [--db poohbot.db]
 
 Safe to re-run: existing rows (matched by guild_id + message_id, or by
 guild_id + quote_number) are left alone instead of duplicated/erroring.
@@ -15,7 +15,7 @@ import json
 import sqlite3
 from datetime import datetime, timezone
 
-# Keep this in sync with init_db()'s "quotes" table in report_bot.py.
+# Keep this in sync with init_db()'s "quotes" table in poohbot.py.
 CREATE_QUOTES_TABLE = """
 CREATE TABLE IF NOT EXISTS quotes (
     quote_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -49,7 +49,7 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("json_file", help="Path to the exported quotes.json")
-    parser.add_argument("--db", default="reportbot.db", help="Path to reportbot.db (default: reportbot.db)")
+    parser.add_argument("--db", default="poohbot.db", help="Path to poohbot.db (default: poohbot.db)")
     args = parser.parse_args()
 
     with open(args.json_file, encoding="utf-8") as f:

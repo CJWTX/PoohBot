@@ -11,7 +11,7 @@ EnvironmentFile=/home/cjwitmer/Poohbot/token.env
 # Write print() output straight to the journal instead of holding it back
 # (buffered output is lost when systemd stops the bot).
 Environment=PYTHONUNBUFFERED=1
-ExecStart=/home/cjwitmer/Poohbot/venv/bin/python /home/cjwitmer/Poohbot/report_bot.py
+ExecStart=/home/cjwitmer/Poohbot/venv/bin/python /home/cjwitmer/Poohbot/poohbot.py
 Restart=on-failure
 RestartSec=5
 
