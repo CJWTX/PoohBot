@@ -2426,7 +2426,8 @@ async def pingbackqueue(interaction: discord.Interaction, user: discord.Member =
     rows = get_ping_back_queue(interaction.guild_id, user.id if user else None)
     if not rows:
         await interaction.response.send_message(
-            f"No ping-backs queued for {user.mention}." if user else "No ping-backs are queued.", ephemeral=True
+            f"No ping-backs queued for {user.mention}." if user else "No ping-backs are queued.",
+            allowed_mentions=discord.AllowedMentions.none(),  # posted publicly — don't ping them
         )
         return
 
@@ -2449,7 +2450,7 @@ async def pingbackqueue(interaction: discord.Interaction, user: discord.Member =
     embed = discord.Embed(
         title=f"Queued ping-backs ({len(rows)})", description=description.strip(), color=discord.Color.blurple()
     )
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+    await interaction.response.send_message(embed=embed)
 
 
 @bot.tree.command(
@@ -3732,8 +3733,14 @@ async def handle_quote_save(payload: discord.RawReactionActionEvent, guild: disc
     note = f"New quote added by {saver_name} as #{quote_number} {message.jump_url}"
     try:
         await channel.send(note, reference=message, mention_author=False)
-    except (discord.Forbidden, discord.HTTPException):
-        pass  # the quote is saved either way; the confirmation is a nicety
+    except (discord.Forbidden, discord.HTTPException) as e:
+        # The quote is saved either way; the confirmation is a nicety. Still
+        # log why it failed, since it's otherwise invisible.
+        print(
+            f"[quote] #{quote_number} saved but confirmation failed in #{channel} "
+            f"(message {payload.message_id}): {type(e).__name__} {getattr(e, 'status', '')} {e}",
+            flush=True,
+        )
 
 
 async def handle_pin_request(payload: discord.RawReactionActionEvent, guild: discord.Guild):
