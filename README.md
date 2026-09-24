@@ -142,6 +142,7 @@ To add poohbot to your server: [Click this link](https://discord.com/oauth2/auth
 | `/setstatus` | Bot owner | Change the bot's Discord status |
 | `/capybara` | Anyone | Post a random capybara gif (needs `KLIPY_API_KEY`) |
 | `/foxxo` | Anyone | Post a random fox gif (needs `KLIPY_API_KEY`) |
+| `.yt <keywords>` / `.youtube` | Anyone | Post the top YouTube result as an embedded video (needs `YOUTUBE_API_KEY`, 30s per-user cooldown) |
 | `/fu` | Anyone | Draw a middle finger in ASCII art |
 | `/setlocation` | Anyone | Save your location (city or US ZIP) for `.w` |
 | `.w` / `.weather` | Anyone | Show today's forecast for your saved location |
@@ -188,6 +189,9 @@ main report channel if left unset.
    # optional, required only for /capybara — get a free key at
    # https://klipy.com/developers
    export KLIPY_API_KEY="your-klipy-key"
+   # optional, required only for .yt — create a key in Google Cloud Console
+   # with "YouTube Data API v3" enabled
+   export YOUTUBE_API_KEY="your-youtube-key"
    ```
 
 4. **Run it:**

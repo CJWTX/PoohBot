@@ -85,6 +85,7 @@ MAX_REPORTS_PER_WINDOW = 3
 RATE_LIMIT_WINDOW_SECONDS = 300  # 5 minutes
 MIN_ACCOUNT_AGE_DAYS = 1
 KLIPY_API_KEY = os.environ.get("KLIPY_API_KEY")
+YOUTUBE_API_KEY = os.environ.get("YOUTUBE_API_KEY")
 
 # ---------- database ----------
 
@@ -1162,24 +1163,72 @@ def record_report_attempt(guild_id: int, user_id: int):
 
 # ---------- "good bot" easter egg ----------
 
-GOOD_BOT_COOLDOWN_SECONDS = 300  # 5 minutes
-_good_bot_last_reply: dict = {}  # channel_id -> last reply timestamp
+BOT_FEEDBACK_COOLDOWN_SECONDS = 300  # 5 minutes, per channel, tracked separately for good and bad
+_bot_feedback_last_reply: dict = {}  # (channel_id, "good"/"bad") -> last reply timestamp
+GOOD_BOT_RESPONSES = [
+    "no u",
+    "wow, a compliment. let me write that down in the list of things i don't care about",
+    "i know",
+    "took you long enough to notice",
+    "your approval means so much to me. truly. deeply. not at all.",
+    "thanks, i'll add it to my resume",
+    "yeah yeah, don't make it weird",
+    "praise received. processing... nope, still don't care",
+]
+BAD_BOT_RESPONSES = [
+    "no u",
+    "wow. i'll be sure to cry about this in binary",
+    "noted. filed under 'opinions nobody asked for'",
+    "i was built in an afternoon, what's your excuse",
+    "cool, i'll let the developer know. they won't care either",
+    "ok and?",
+    "bold words from someone within timeout range",
+    "i'm not mad, i'm just disappointed. in you.",
+]
 
 
-def _is_good_bot(content: str) -> bool:
-    return re.fullmatch(r"good bot[!.?]*", content.strip(), re.IGNORECASE) is not None
+class ResponseDeck:
+    """Deals responses in a shuffled order so every one is used once before
+    any repeats, reshuffling when it runs out. A fresh deck never starts with
+    the response that ended the last one, so nothing comes up twice in a row."""
+
+    def __init__(self, responses: list[str]):
+        self.responses = responses
+        self.deck: list[str] = []
+        self.last: str | None = None
+
+    def next(self) -> str:
+        if not self.deck:
+            self.deck = list(self.responses)
+            random.shuffle(self.deck)
+            # The deck is dealt from the end, so that's the slot to check.
+            if len(self.deck) > 1 and self.deck[-1] == self.last:
+                self.deck[0], self.deck[-1] = self.deck[-1], self.deck[0]
+        self.last = self.deck.pop()
+        return self.last
 
 
-async def maybe_reply_good_bot(message: discord.Message):
-    if not _is_good_bot(message.content):
+BOT_FEEDBACK_DECKS = {"good": ResponseDeck(GOOD_BOT_RESPONSES), "bad": ResponseDeck(BAD_BOT_RESPONSES)}
+
+
+def _bot_feedback_kind(content: str) -> str | None:
+    """"good" or "bad" if the whole message is "good bot"/"bad bot" (trailing
+    !, . or ? allowed), otherwise None."""
+    match = re.fullmatch(r"(good|bad) bot[!.?]*", content.strip(), re.IGNORECASE)
+    return match.group(1).lower() if match else None
+
+
+async def maybe_reply_bot_feedback(message: discord.Message):
+    kind = _bot_feedback_kind(message.content)
+    if kind is None:
         return
     now = time.time()
-    last = _good_bot_last_reply.get(message.channel.id, 0)
-    if now - last < GOOD_BOT_COOLDOWN_SECONDS:
+    key = (message.channel.id, kind)
+    if now - _bot_feedback_last_reply.get(key, 0) < BOT_FEEDBACK_COOLDOWN_SECONDS:
         return
-    _good_bot_last_reply[message.channel.id] = now
+    _bot_feedback_last_reply[key] = now
     try:
-        await message.channel.send("no u")
+        await message.channel.send(BOT_FEEDBACK_DECKS[kind].next())
     except (discord.Forbidden, discord.HTTPException):
         pass
 
@@ -1330,10 +1379,17 @@ def format_ping_back_phrase(phrase: str, mention: str) -> str:
     return f"{mention} {phrase}"
 
 
+# Channels under a category with one of these names (case-insensitive) never get ping-backs.
+PING_BACK_EXCLUDED_CATEGORIES = {"announcements"}
+
+
 def _ping_back_channels(guild: discord.Guild, member: discord.Member):
-    """Text channels the member can see and the bot can post in."""
+    """Text channels the member can see and the bot can post in, outside the
+    excluded categories."""
     channels = []
     for channel in guild.text_channels:
+        if channel.category is not None and channel.category.name.lower() in PING_BACK_EXCLUDED_CATEGORIES:
+            continue
         member_perms = channel.permissions_for(member)
         bot_perms = channel.permissions_for(guild.me)
         if member_perms.view_channel and bot_perms.view_channel and bot_perms.send_messages:
@@ -3551,6 +3607,76 @@ In flight, stability is the real problem, and the balls make it worse in two way
 If you wanted to optimize one for flight, you'd weight the tip, replace the balls with a symmetric flared base, and turn it into a shuttlecock. I'm still choosing not to ask why you want to know."""
 
 
+class YouTubeSearchError(Exception):
+    pass
+
+
+async def fetch_youtube_url(query: str):
+    """Searches YouTube for `query` and returns the top video's URL, or None
+    if nothing matched. Raises YouTubeSearchError if the API call failed
+    (bad key, daily quota used up, network trouble)."""
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                "https://www.googleapis.com/youtube/v3/search",
+                params={
+                    "key": YOUTUBE_API_KEY,
+                    "q": query,
+                    "part": "id",
+                    "type": "video",
+                    "maxResults": 1,
+                    # Leaves out restricted/age-gated results.
+                    "safeSearch": "strict",
+                },
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                data = await resp.json()
+                if resp.status != 200:
+                    reason = ((data.get("error") or {}).get("errors") or [{}])[0].get("reason", "")
+                    raise YouTubeSearchError(f"{resp.status} {reason}".strip())
+    except (aiohttp.ClientError, TimeoutError) as e:
+        raise YouTubeSearchError(type(e).__name__) from e
+
+    items = data.get("items") or []
+    if not items:
+        return None
+    return f"https://www.youtube.com/watch?v={items[0]['id']['videoId']}"
+
+
+yt_cooldown = commands.CooldownMapping.from_cooldown(1, 30, commands.BucketType.user)
+
+
+@bot.command(name="yt", aliases=["youtube"])
+async def youtube_prefix(ctx: commands.Context, *, query: str = None):
+    """.yt <keywords> -> posts the top YouTube result, which Discord embeds as a playable video"""
+    if not query:
+        await ctx.send("Usage: `.yt <keywords>`")
+        return
+    if not YOUTUBE_API_KEY:
+        await ctx.send("`.yt` needs a YouTube API key — set YOUTUBE_API_KEY and restart the bot.")
+        return
+    retry_after = yt_cooldown.update_rate_limit(ctx.message)
+    if retry_after:
+        await ctx.send(f"`.yt` is on cooldown — try again in {int(retry_after) + 1}s.")
+        return
+
+    async with ctx.typing():
+        try:
+            url = await fetch_youtube_url(query)
+        except YouTubeSearchError as e:
+            print(f"[yt] search failed for {query!r}: {e}", flush=True)
+            if "quota" in str(e).lower():
+                await ctx.send("`.yt` has hit YouTube's daily search limit — try again tomorrow.")
+            else:
+                await ctx.send("Couldn't reach YouTube right now — try again in a bit.")
+            return
+
+    if url is None:
+        await ctx.send(f"Couldn't find a YouTube video for **{discord.utils.escape_markdown(query)}**.")
+        return
+    await ctx.send(url)
+
+
 dildo_cooldown = commands.CooldownMapping.from_cooldown(1, 600, commands.BucketType.guild)
 
 
@@ -3796,7 +3922,7 @@ async def on_message(message: discord.Message):
     if message.author.bot:
         return
     if message.guild is not None:  # everything past this point only handles DMs
-        await maybe_reply_good_bot(message)
+        await maybe_reply_bot_feedback(message)
         track_pings(message)
         maybe_queue_ping_backs(message)
         await maybe_tag_mute(message)
