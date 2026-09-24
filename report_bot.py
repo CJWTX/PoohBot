@@ -261,7 +261,8 @@ def init_db():
         )"""
     )
     # Ping scoreboard: how many messages pinger_id has explicitly tagged
-    # target_id in (replies don't count).
+    # target_id in (replies don't count). target_id is a role when
+    # target_is_role is 1 (role and user IDs never collide).
     conn.execute(
         """CREATE TABLE IF NOT EXISTS ping_counts (
             guild_id INTEGER,
@@ -279,6 +280,7 @@ def init_db():
     _migrate_add_column("guild_config", "simonsays_log_channel_id", "INTEGER")
     _migrate_add_column("guild_config", "no_quote_role_id", "INTEGER")
     _migrate_add_column("guild_config", "ping_back_role_id", "INTEGER")
+    _migrate_add_column("ping_counts", "target_is_role", "INTEGER NOT NULL DEFAULT 0")
     _migrate_add_column("user_locations", "is_us", "INTEGER")
     _migrate_add_column("user_locations", "wind_speed_unit", "TEXT")
 
@@ -707,12 +709,12 @@ def delete_ping_back_phrase(phrase_id: int):
     conn.close()
 
 
-def record_pings(guild_id: int, pinger_id: int, target_ids):
+def record_pings(guild_id: int, pinger_id: int, target_ids, is_role: bool = False):
     conn = db_connect()
     conn.executemany(
-        "INSERT INTO ping_counts (guild_id, pinger_id, target_id, count) VALUES (?, ?, ?, 1) "
+        "INSERT INTO ping_counts (guild_id, pinger_id, target_id, count, target_is_role) VALUES (?, ?, ?, 1, ?) "
         "ON CONFLICT(guild_id, pinger_id, target_id) DO UPDATE SET count = count + 1",
-        [(guild_id, pinger_id, target_id) for target_id in target_ids],
+        [(guild_id, pinger_id, target_id, int(is_role)) for target_id in target_ids],
     )
     conn.commit()
     conn.close()
@@ -726,12 +728,12 @@ def clear_ping_counts(guild_id: int):
 
 
 def add_ping_counts(guild_id: int, counts: Counter):
-    """Adds {(pinger_id, target_id): n} on top of whatever is already stored."""
+    """Adds {(pinger_id, target_id, is_role): n} on top of whatever is already stored."""
     conn = db_connect()
     conn.executemany(
-        "INSERT INTO ping_counts (guild_id, pinger_id, target_id, count) VALUES (?, ?, ?, ?) "
+        "INSERT INTO ping_counts (guild_id, pinger_id, target_id, count, target_is_role) VALUES (?, ?, ?, ?, ?) "
         "ON CONFLICT(guild_id, pinger_id, target_id) DO UPDATE SET count = count + excluded.count",
-        [(guild_id, pinger_id, target_id, n) for (pinger_id, target_id), n in counts.items()],
+        [(guild_id, pinger_id, target_id, n, int(is_role)) for (pinger_id, target_id, is_role), n in counts.items()],
     )
     conn.commit()
     conn.close()
@@ -740,7 +742,7 @@ def add_ping_counts(guild_id: int, counts: Counter):
 def get_top_pingers(guild_id: int, limit: int = 10):
     conn = db_connect()
     rows = conn.execute(
-        "SELECT pinger_id AS user_id, SUM(count) AS total FROM ping_counts WHERE guild_id = ? "
+        "SELECT pinger_id AS user_id, 0 AS is_role, SUM(count) AS total FROM ping_counts WHERE guild_id = ? "
         "GROUP BY pinger_id ORDER BY total DESC LIMIT ?",
         (guild_id, limit),
     ).fetchall()
@@ -748,12 +750,13 @@ def get_top_pingers(guild_id: int, limit: int = 10):
     return rows
 
 
-def get_top_pinged(guild_id: int, limit: int = 10):
+def get_top_pinged(guild_id: int, limit: int = 10, roles: bool = False):
+    """Most-pinged users, or most-pinged roles with roles=True."""
     conn = db_connect()
     rows = conn.execute(
-        "SELECT target_id AS user_id, SUM(count) AS total FROM ping_counts WHERE guild_id = ? "
-        "GROUP BY target_id ORDER BY total DESC LIMIT ?",
-        (guild_id, limit),
+        "SELECT target_id AS user_id, target_is_role AS is_role, SUM(count) AS total FROM ping_counts "
+        "WHERE guild_id = ? AND target_is_role = ? GROUP BY target_id ORDER BY total DESC LIMIT ?",
+        (guild_id, int(roles), limit),
     ).fetchall()
     conn.close()
     return rows
@@ -771,13 +774,13 @@ def get_ping_stats_for_user(guild_id: int, user_id: int, limit: int = 5) -> dict
         (guild_id, user_id),
     ).fetchone()["n"]
     top_targets = conn.execute(
-        "SELECT target_id AS user_id, count AS total FROM ping_counts WHERE guild_id = ? AND pinger_id = ? "
-        "ORDER BY count DESC LIMIT ?",
+        "SELECT target_id AS user_id, target_is_role AS is_role, count AS total FROM ping_counts "
+        "WHERE guild_id = ? AND pinger_id = ? ORDER BY count DESC LIMIT ?",
         (guild_id, user_id, limit),
     ).fetchall()
     top_pingers = conn.execute(
-        "SELECT pinger_id AS user_id, count AS total FROM ping_counts WHERE guild_id = ? AND target_id = ? "
-        "ORDER BY count DESC LIMIT ?",
+        "SELECT pinger_id AS user_id, 0 AS is_role, count AS total FROM ping_counts "
+        "WHERE guild_id = ? AND target_id = ? ORDER BY count DESC LIMIT ?",
         (guild_id, user_id, limit),
     ).fetchall()
     conn.close()
@@ -1173,6 +1176,8 @@ def tag_mute_seconds_per_offense() -> int:
 # reply even with no literal "@" in the text) — replies alone shouldn't
 # count as tagging someone.
 USER_MENTION_RE = re.compile(r"<@!?(\d+)>")
+# "<@&123>" — a role mention typed into the message content.
+ROLE_MENTION_RE = re.compile(r"<@&(\d+)>")
 
 
 async def maybe_tag_mute(message: discord.Message):
@@ -1180,17 +1185,15 @@ async def maybe_tag_mute(message: discord.Message):
     tagged someone else (an explicit @mention, not just a reply, and not a
     bot), times them out — the base timeout (5 seconds by default) the
     first time, growing by that much again on every offense after that.
-    Any message that tags this bot is let off entirely, even if it tags
-    other people too."""
+    Tagging a role counts too. Any message that tags this bot (or its
+    role) is let off entirely, even if it tags other people too."""
     if message.guild is None or not isinstance(message.author, discord.Member):
         return
     if not is_tag_mute_watched(message.guild.id, message.author.id):
         return
-
-    mentioned_ids = {int(uid) for uid in USER_MENTION_RE.findall(message.content or "")}
-    if bot.user.id in mentioned_ids:
+    if tags_this_bot(message):
         return
-    if not ping_targets(message):
+    if not ping_targets(message) and not role_ping_targets(message):
         return
 
     offense_count = bump_tag_mute_offense(message.guild.id, message.author.id)
@@ -1217,12 +1220,37 @@ def ping_targets(message: discord.Message) -> set[int]:
     return mentioned_ids - bot_ids - {message.author.id, bot.user.id}
 
 
+def role_ping_targets(message: discord.Message) -> set[int]:
+    """The roles this message explicitly @tags. Roles that belong to a bot
+    (the one Discord creates for each bot) are ignored, like bot users."""
+    role_ids = set()
+    for role_id in {int(rid) for rid in ROLE_MENTION_RE.findall(message.content or "")}:
+        role = message.guild.get_role(role_id)
+        if role is not None and not role.is_default() and not role.is_bot_managed():
+            role_ids.add(role_id)
+    return role_ids
+
+
+def tags_this_bot(message: discord.Message) -> bool:
+    """Whether the message tags this bot, directly or through its bot role."""
+    if bot.user.id in {int(uid) for uid in USER_MENTION_RE.findall(message.content or "")}:
+        return True
+    for role_id in ROLE_MENTION_RE.findall(message.content or ""):
+        role = message.guild.get_role(int(role_id))
+        if role is not None and role.tags is not None and role.tags.bot_id == bot.user.id:
+            return True
+    return False
+
+
 def track_pings(message: discord.Message):
     if message.guild is None:
         return
     target_ids = ping_targets(message)
     if target_ids:
         record_pings(message.guild.id, message.author.id, target_ids)
+    role_ids = role_ping_targets(message)
+    if role_ids:
+        record_pings(message.guild.id, message.author.id, role_ids, is_role=True)
 
 
 # ---------- ping-back watch list ----------
@@ -2101,7 +2129,8 @@ async def setmutetimeout_error(interaction: discord.Interaction, error: app_comm
 def _format_ping_rows(rows) -> str:
     medals = {1: "🥇", 2: "🥈", 3: "🥉"}
     return "\n".join(
-        f"{medals.get(i, f'`{i}.`')} <@{row['user_id']}> — {row['total']}" for i, row in enumerate(rows, start=1)
+        f"{medals.get(i, f'`{i}.`')} <@{'&' if row['is_role'] else ''}{row['user_id']}> — {row['total']}"
+        for i, row in enumerate(rows, start=1)
     ) or "*nobody yet*"
 
 
@@ -2116,6 +2145,9 @@ async def pingscoreboard(interaction: discord.Interaction, user: discord.Member 
         embed = discord.Embed(title=f"Ping scoreboard — {interaction.guild.name}", color=discord.Color.blurple())
         embed.add_field(name="Top pingers", value=_format_ping_rows(pingers), inline=True)
         embed.add_field(name="Most pinged", value=_format_ping_rows(get_top_pinged(interaction.guild_id)), inline=True)
+        top_roles = get_top_pinged(interaction.guild_id, roles=True)
+        if top_roles:
+            embed.add_field(name="Most pinged roles", value=_format_ping_rows(top_roles), inline=True)
     else:
         stats = get_ping_stats_for_user(interaction.guild_id, user.id)
         embed = discord.Embed(
@@ -2193,7 +2225,9 @@ async def run_ping_backfill(guild: discord.Guild, report_channel, days: int | No
                     if message.author.bot:
                         continue
                     for target_id in ping_targets(message):
-                        counts[(message.author.id, target_id)] += 1
+                        counts[(message.author.id, target_id, False)] += 1
+                    for role_id in role_ping_targets(message):
+                        counts[(message.author.id, role_id, True)] += 1
             except (discord.Forbidden, discord.HTTPException):
                 skipped_channels += 1
                 continue
@@ -3421,6 +3455,43 @@ async def wikipedia_prefix(ctx: commands.Context, *, topic: str = None):
         return
 
     await ctx.send(url)
+
+
+DILDO_AERODYNAMICS = """Pretty poorly, and it depends a lot on which way it's pointed.
+
+Tip-first, the front is the best part. The rounded head behaves a bit like a blunt bullet nose and lets air flow around it fairly smoothly. The back end undoes that. The shaft widens abruptly into two lumpy bulges at the base, and those bluff surfaces leave a large, turbulent wake, which is where most of the drag comes from. You'd probably land around a drag coefficient of 0.6 to 0.9, closer to an upright cyclist or a boxy SUV than to a streamlined teardrop (about 0.04).
+
+Sideways, the shaft is basically a cylinder in crossflow, with a drag coefficient around 1.0 to 1.2, and the balls add extra frontal area on top of that. That's about as draggy as everyday shapes get.
+
+In flight, stability is the real problem, and the balls make it worse in two ways. First, asymmetry: because they sit on one side, air moves differently over the top and bottom, creating sideways and lifting forces that twist the object off course almost as soon as it's thrown. Second, weight distribution: for something to fly straight nose-first, like a dart or a badminton shuttlecock, you want the center of mass forward and the drag concentrated at the rear. The balls do add rear drag, which helps, but solid silicone is heavy, so they also pull the center of mass backward, which hurts more. Add a floppy shaft and it will almost certainly tumble end over end, and a tumbling object's drag averages out close to the ugly sideways number.
+
+If you wanted to optimize one for flight, you'd weight the tip, replace the balls with a symmetric flared base, and turn it into a shuttlecock. I'm still choosing not to ask why you want to know."""
+
+
+dildo_cooldown = commands.CooldownMapping.from_cooldown(1, 600, commands.BucketType.guild)
+
+
+@bot.command(name="dildo")
+async def dildo_prefix(ctx: commands.Context):
+    """.dildo -> posts a card on the aerodynamics of a dildo (once per 10 minutes per server)"""
+    retry_after = dildo_cooldown.update_rate_limit(ctx.message)
+    if retry_after:
+        minutes, seconds = divmod(int(retry_after) + 1, 60)
+        await ctx.send(f".dildo isn't quite ready for round 2 - try again in {minutes}m {seconds}s")
+        return
+    # Looked up by name so it survives the emote being re-uploaded; the bot
+    # can use it anywhere as long as it's in the server that owns it.
+    emoji = discord.utils.get(ctx.guild.emojis if ctx.guild else (), name="dildoomba") or discord.utils.get(
+        bot.emojis, name="dildoomba"
+    )
+    ending = str(emoji) if emoji else ":dildoomba:"
+    await ctx.send(
+        embed=discord.Embed(
+            title="How aerodynamic is a dildo?",
+            description=f"{DILDO_AERODYNAMICS} {ending}",
+            color=discord.Color.blurple(),
+        )
+    )
 
 
 @bot.event

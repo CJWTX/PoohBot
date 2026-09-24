@@ -108,9 +108,11 @@ To add poohbot to your server: [Click this link](https://discord.com/oauth2/auth
 - `/setstatus` — sets the bot's Discord activity status (bot owner only).
 
 **Ping scoreboard**
-- Every explicit @tag of another user is counted (once per user per
-  message). Replies don't count, and neither do self-tags or tags of bots.
-- `/pingscoreboard` shows the server's top pingers and most-pinged users;
+- Every explicit @tag of another user or a role is counted (once per
+  user/role per message). Replies don't count, and neither do self-tags or
+  tags of bots (or their bot roles).
+- `/pingscoreboard` shows the server's top pingers, most-pinged users and
+  most-pinged roles;
   `/pingscoreboard user:` shows who that person pings most and who pings
   them most.
 - `/backfillpings` (bot owner) wipes the server's counts and rebuilds them
