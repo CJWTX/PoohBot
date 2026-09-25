@@ -2525,6 +2525,12 @@ async def pingbackqueue(interaction: discord.Interaction, user: discord.Member =
 async def addpingbackphrase(
     interaction: discord.Interaction, phrase: app_commands.Range[str, 1, PING_BACK_PHRASE_MAX_LENGTH]
 ):
+    lowered = phrase.lower()
+    if "@everyone" in lowered or "@here" in lowered:
+        await interaction.response.send_message(
+            "Ping-back phrases can't include @everyone or @here.", ephemeral=True
+        )
+        return
     number = add_ping_back_phrase(interaction.guild_id, phrase, interaction.user.id)
     await interaction.response.send_message(
         f"Added phrase #{number}. Preview:\n> {format_ping_back_phrase(phrase, interaction.user.mention)}",
