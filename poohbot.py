@@ -20,7 +20,7 @@ FEATURES
   - /reports @user - moderation history (times reported + warnings)
   - Quote board: react 💬 to any message to save it as a numbered quote,
     then recall it with ".q 12" (or /quote), browse with /quotes,
-    search text with ".q s <keyword>"
+    search text with ".q s <keyword>", or add one by hand with ".q add <quote> @user"
   - /setreportchannel, /setoncallrole, /setnoquoterole - per-server config
   - /capybara - posts a random capybara gif (needs KLIPY_API_KEY)
   - /setlocation + ".w" - set your location once (city name or 5-digit US
@@ -2946,6 +2946,61 @@ class QuoteListView(discord.ui.View):
         await interaction.response.edit_message(embed=self.build_embed(), view=self)
 
 
+MANUAL_QUOTE_RE = re.compile(r"^(?P<content>.+?)\s*<@!?(?P<user_id>\d+)>\s*$", re.DOTALL)
+
+
+async def add_manual_quote(ctx: commands.Context, text: str):
+    """.q add <quote> @user — saves a quote typed by hand. The author must be a
+    real @mention at the end so the quote links to an actual member."""
+    usage = "Use `.q add <quote> @user` — the author has to be an @mention at the end."
+    match = MANUAL_QUOTE_RE.match(text.strip())
+    if match is None:
+        await ctx.send(usage)
+        return
+    content = match["content"].strip().strip('"“”').strip()
+    if not content:
+        await ctx.send(usage)
+        return
+
+    author_id = int(match["user_id"])
+    author = ctx.guild.get_member(author_id)
+    if author is None:
+        try:
+            author = await ctx.guild.fetch_member(author_id)
+        except (discord.NotFound, discord.HTTPException):
+            await ctx.send("I couldn't find that member in this server.")
+            return
+
+    if author.id == ctx.author.id:
+        await ctx.send("slow down narcissist, you cant quote yourself")
+        return
+    no_quote_role_id = no_quote_role_id_for(ctx.guild.id)
+    if no_quote_role_id is not None and any(role.id == no_quote_role_id for role in author.roles):
+        await ctx.send(f"{author.display_name} is exempt from being quoted.")
+        return
+
+    now = datetime.now(timezone.utc).isoformat()
+    # There's no original message to point at, so the .q add command message
+    # stands in as the unique message_id and the quote gets no jump link.
+    quote_number, created = create_quote(
+        guild_id=ctx.guild.id,
+        message_id=ctx.message.id,
+        channel_id=ctx.channel.id,
+        author_id=author.id,
+        author_name=author.display_name,
+        content=content,
+        image_url=None,
+        jump_url=None,
+        saved_by_id=ctx.author.id,
+        message_created_at=now,
+        created_at=now,
+    )
+    if quote_number is None or not created:
+        await ctx.send("Something went wrong saving that quote — try again.")
+        return
+    await ctx.send(f"New quote added by {ctx.author.display_name} as #{quote_number}")
+
+
 q_help_cooldown = commands.CooldownMapping.from_cooldown(1, 300, commands.BucketType.user)
 quote_zero_cooldown = commands.CooldownMapping.from_cooldown(1, 3600, commands.BucketType.user)
 
@@ -2955,7 +3010,7 @@ async def quote_prefix(ctx: commands.Context, *, target: str = None):
     """.q -> random quote | .q 12 -> quote #12 | .q <username> -> list quotes by them |
     .q me -> list your own | .q list -> browse all | .q s <keyword> -> search quote text |
     .q delete <number> -> delete a quote you added (or any, with Manage Messages) |
-    .q help -> list what everyone can do"""
+    .q add <quote> @user -> save a quote by hand | .q help -> list what everyone can do"""
     if ctx.guild is None:
         await ctx.send("Quotes only work inside a server.")
         return
@@ -2976,6 +3031,7 @@ async def quote_prefix(ctx: commands.Context, *, target: str = None):
             "`.q list` — browse every quote, paginated\n"
             "`.q s <keyword>` — search quote text\n"
             "`.q delete <number>` — delete a quote you added yourself\n"
+            "`.q add <quote> @user` — save a quote by hand, credited to @user\n"
             "React 💬 (or 🗨️ / 🗯️) on any message to save it as a new quote.\n"
             "React 📌 on any message to request that it be pinned."
         )
@@ -3029,6 +3085,10 @@ async def quote_prefix(ctx: commands.Context, *, target: str = None):
             return
         delete_quote(ctx.guild.id, number)
         await ctx.send(f"Deleted quote #{number}. Later quotes have been renumbered to close the gap.")
+        return
+
+    if parts and parts[0].lower() == "add":
+        await add_manual_quote(ctx, parts[1] if len(parts) > 1 else "")
         return
 
     if not target:
