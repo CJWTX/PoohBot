@@ -143,6 +143,7 @@ To add poohbot to your server: [Click this link](https://discord.com/oauth2/auth
 | `/capybara` | Anyone | Post a random capybara gif (needs `KLIPY_API_KEY`) |
 | `/foxxo` | Anyone | Post a random fox gif (needs `KLIPY_API_KEY`) |
 | `.yt <keywords>` / `.youtube` | Anyone | Post the top YouTube result as an embedded video (needs `YOUTUBE_API_KEY`, 30s per-user cooldown) |
+| `.remind me in <time> to <thing>` (or `.remind me to <thing> in <time>`) | Anyone | Set a reminder; the bot replies to your message and pings you when it's due. `.remind list` / `.remind cancel <id>` manage them |
 | `/fu` | Anyone | Draw a middle finger in ASCII art |
 | `/setlocation` | Anyone | Save your location (city or US ZIP) for `.w` |
 | `.w` / `.weather` | Anyone | Show today's forecast for your saved location |

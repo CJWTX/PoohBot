@@ -31,6 +31,9 @@ FEATURES
     ".w" forecasts
   - ".wiki <topic>" - posts the top Wikipedia result for a topic (no API
     key needed)
+  - ".remind me in 2 hours to <thing>" / ".remind me to <thing> in 2 hours" -
+    pings you with a reply in the same channel when it's due (DM fallback);
+    ".remind list" and ".remind cancel <id>" manage pending ones
   - /setmutewhentagging, /clearmutewhentagging, /resetmuteoffenses - [bot
     owner only] put a user on a per-server watch list that auto-times them
     out every time they tag someone; the timeout grows by 5 seconds per
@@ -271,6 +274,20 @@ def init_db():
             target_id INTEGER,
             count INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY (guild_id, pinger_id, target_id)
+        )"""
+    )
+    # .remind me reminders. guild_id is NULL for ones set in DMs; message_id
+    # is the .remind command message, which the reminder replies to.
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS reminders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            guild_id INTEGER,
+            channel_id INTEGER,
+            message_id INTEGER,
+            text TEXT,
+            fire_at TEXT,
+            created_at TEXT
         )"""
     )
     conn.commit()
@@ -742,6 +759,63 @@ def delete_ping_back_phrase(phrase_id: int):
     conn.execute("DELETE FROM ping_back_phrases WHERE id = ?", (phrase_id,))
     conn.commit()
     conn.close()
+
+
+def add_reminder(user_id: int, guild_id: int | None, channel_id: int, message_id: int, text: str, fire_at: datetime) -> int:
+    conn = db_connect()
+    cur = conn.execute(
+        "INSERT INTO reminders (user_id, guild_id, channel_id, message_id, text, fire_at, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (user_id, guild_id, channel_id, message_id, text,
+         fire_at.isoformat(timespec="microseconds"), datetime.now(timezone.utc).isoformat()),
+    )
+    conn.commit()
+    reminder_id = cur.lastrowid
+    conn.close()
+    return reminder_id
+
+
+def get_user_reminders(user_id: int, guild_id: int | None = None):
+    """A user's pending reminders, soonest first. Pass guild_id=None for the
+    ones they set in DMs."""
+    conn = db_connect()
+    rows = conn.execute(
+        "SELECT * FROM reminders WHERE user_id = ? AND guild_id IS ? ORDER BY fire_at", (user_id, guild_id)
+    ).fetchall()
+    conn.close()
+    return rows
+
+
+def count_user_reminders(user_id: int) -> int:
+    conn = db_connect()
+    count = conn.execute("SELECT COUNT(*) FROM reminders WHERE user_id = ?", (user_id,)).fetchone()[0]
+    conn.close()
+    return count
+
+
+def get_due_reminders(now: datetime):
+    """Every reminder whose time has come, oldest first. They stay stored
+    until delete_reminder() is called, so a failed send is retried."""
+    conn = db_connect()
+    rows = conn.execute(
+        "SELECT * FROM reminders WHERE fire_at <= ? ORDER BY fire_at",
+        (now.isoformat(timespec="microseconds"),),
+    ).fetchall()
+    conn.close()
+    return rows
+
+
+def delete_reminder(reminder_id: int, user_id: int = None) -> bool:
+    """Deletes a reminder; with user_id, only if it belongs to them."""
+    conn = db_connect()
+    if user_id is None:
+        cur = conn.execute("DELETE FROM reminders WHERE id = ?", (reminder_id,))
+    else:
+        cur = conn.execute("DELETE FROM reminders WHERE id = ? AND user_id = ?", (reminder_id, user_id))
+    conn.commit()
+    deleted = cur.rowcount > 0
+    conn.close()
+    return deleted
 
 
 def record_pings(guild_id: int, pinger_id: int, target_ids, is_role: bool = False):
@@ -3750,6 +3824,182 @@ async def youtube_prefix(ctx: commands.Context, *, query: str = None):
     await ctx.send(url)
 
 
+# ---------- .remind me ----------
+
+_REMIND_UNITS = {
+    "s": 1, "sec": 1, "secs": 1, "second": 1, "seconds": 1,
+    "m": 60, "min": 60, "mins": 60, "minute": 60, "minutes": 60,
+    "h": 3600, "hr": 3600, "hrs": 3600, "hour": 3600, "hours": 3600,
+    "d": 86400, "day": 86400, "days": 86400,
+    "w": 604800, "wk": 604800, "wks": 604800, "week": 604800, "weeks": 604800,
+}
+_UNIT_PATTERN = "|".join(sorted(_REMIND_UNITS, key=len, reverse=True))
+def _duration_part_pattern(named: bool) -> str:
+    """One "<amount> <unit>" piece: "2 hours", "30m", "1.5 hrs", "an hour",
+    "an hour and a half", "half an hour". Named groups for parse_duration();
+    plain ones for embedding (repeated) inside the bigger reminder patterns."""
+    def g(name):
+        return f"?P<{name}>" if named else "?:"
+    return (
+        rf"(?:(?:({g('number')}\d+(?:\.\d+)?)\s*|\b({g('word')}an?|one)\s+)({g('unit')}{_UNIT_PATTERN})(?![a-z])"
+        rf"({g('and_half')}\s+and\s+a\s+half\b)?"
+        rf"|\bhalf\s+(?:an?\s+)?({g('half_unit')}{_UNIT_PATTERN})(?![a-z]))"
+    )
+
+
+_DURATION_PART = _duration_part_pattern(named=False)
+_DURATION_PART_RE = re.compile(_duration_part_pattern(named=True), re.IGNORECASE)
+# Pieces can be chained: "1h30m", "1 hour 30 minutes", "2 days, 3 hours and 5 minutes".
+_DURATION = rf"{_DURATION_PART}(?:(?:\s*,\s*|\s+and\s+|\s*){_DURATION_PART})*"
+# ".remind me in 2 hours to change insulin"
+_REMIND_LEADING_RE = re.compile(
+    rf"^in\s+(?P<duration>{_DURATION})\s*,?\s*(?:to\s+)?(?P<text>.+)$", re.IGNORECASE | re.DOTALL
+)
+# ".remind me to change insulin in 2 hours"
+_REMIND_TRAILING_RE = re.compile(
+    rf"^(?:to\s+)?(?P<text>.+?)\s+in\s+(?P<duration>{_DURATION})\s*[.!]*$", re.IGNORECASE | re.DOTALL
+)
+REMINDER_MIN = timedelta(minutes=5)
+REMINDER_MAX = timedelta(days=365)
+MAX_REMINDERS_PER_USER = 25
+
+
+def parse_duration(text: str) -> timedelta:
+    seconds = 0.0
+    for part in _DURATION_PART_RE.finditer(text):
+        if part["half_unit"]:
+            seconds += 0.5 * _REMIND_UNITS[part["half_unit"].lower()]
+            continue
+        value = float(part["number"]) if part["number"] else 1.0
+        if part["and_half"]:
+            value += 0.5
+        seconds += value * _REMIND_UNITS[part["unit"].lower()]
+    return timedelta(seconds=seconds)
+
+
+def parse_reminder(text: str):
+    """Splits "in 2 hours to X" / "to X in 2 hours" into (timedelta, "X"), or
+    None if it doesn't look like either."""
+    text = text.strip()
+    match = _REMIND_LEADING_RE.match(text) or _REMIND_TRAILING_RE.match(text)
+    if match is None:
+        return None
+    reminder_text = match["text"].strip()
+    if not reminder_text:
+        return None
+    return parse_duration(match["duration"]), reminder_text
+
+
+_USER_MENTION_RE = re.compile(r"<@!?(\d+)>")
+_ROLE_MENTION_RE = re.compile(r"<@&(\d+)>")
+
+
+async def _current_user_name(guild: discord.Guild | None, user_id: int) -> str:
+    """Their nickname in this server right now (no members intent, so the
+    member cache can be stale — ask Discord), else their global name."""
+    if guild is not None:
+        try:
+            return (await guild.fetch_member(user_id)).display_name
+        except (discord.NotFound, discord.HTTPException, *_NETWORK_ERRORS):
+            pass
+    try:
+        user = bot.get_user(user_id) or await bot.fetch_user(user_id)
+        return user.display_name
+    except (discord.NotFound, discord.HTTPException, *_NETWORK_ERRORS):
+        return "unknown user"
+
+
+async def untag_mentions(text: str, guild: discord.Guild | None, users=()) -> str:
+    """Swaps user tags for their current nickname (no @) and role tags for
+    "@role" so a reminder shows who it's about without tagging them. users:
+    already-resolved members (e.g. message.mentions) to skip a lookup for."""
+    names = {user.id: user.display_name for user in users}
+    for user_id in {int(found) for found in _USER_MENTION_RE.findall(text)} - names.keys():
+        names[user_id] = await _current_user_name(guild, user_id)
+
+    def role_name(match):
+        role = guild.get_role(int(match[1])) if guild else None
+        return f"@{role.name}" if role else "@unknown-role"
+
+    text = _USER_MENTION_RE.sub(lambda match: names[int(match[1])], text)
+    text = _ROLE_MENTION_RE.sub(role_name, text)
+    # A zero-width space keeps @everyone/@here as plain text.
+    return text.replace("@everyone", "@\u200beveryone").replace("@here", "@\u200bhere")
+
+
+REMIND_USAGE = (
+    "Use `.remind me in 2 hours to change insulin` or `.remind me to change insulin in 2 hours`.\n"
+    "`.remind list` shows your reminders, `.remind cancel <id>` cancels one."
+)
+
+
+@bot.command(name="remind", aliases=["remindme", "reminder", "reminders"])
+async def remind_prefix(ctx: commands.Context, *, args: str = None):
+    """.remind me in <time> to <thing> | .remind me to <thing> in <time> |
+    .remind list -> your pending reminders | .remind cancel <id>"""
+    args = (args or "").strip()
+    guild_id = ctx.guild.id if ctx.guild else None
+    parts = args.split(None, 1)
+    first = parts[0].lower() if parts else ""
+
+    if ctx.invoked_with.lower() == "reminders" or first in ("list", "ls"):
+        rows = get_user_reminders(ctx.author.id, guild_id)
+        if not rows:
+            await ctx.send("You don't have any reminders set here.")
+            return
+        lines = []
+        for row in rows[:MAX_REMINDERS_PER_USER]:
+            when = int(datetime.fromisoformat(row["fire_at"]).timestamp())
+            lines.append(f"`{row['id']}` · <t:{when}:f> — {(await untag_mentions(row['text'], ctx.guild))[:150]}")
+        await ctx.send(
+            "**Your reminders:**\n" + "\n".join(lines),
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+        return
+
+    if first in ("cancel", "delete", "del", "remove"):
+        id_text = parts[1].strip().lstrip("#") if len(parts) > 1 else ""
+        if not id_text.isdigit():
+            await ctx.send("Give me a reminder id to cancel, e.g. `.remind cancel 12` (see `.remind list`).")
+            return
+        if delete_reminder(int(id_text), ctx.author.id):
+            await ctx.send(f"Cancelled reminder `{id_text}`.")
+        else:
+            await ctx.send(f"You don't have a reminder `{id_text}`.")
+        return
+
+    if ctx.invoked_with.lower() != "remindme":
+        if first != "me":
+            await ctx.send(REMIND_USAGE)
+            return
+        args = parts[1] if len(parts) > 1 else ""
+
+    parsed = parse_reminder(args)
+    if parsed is None:
+        await ctx.send(REMIND_USAGE)
+        return
+    delay, text = parsed
+    if delay < REMINDER_MIN:
+        await ctx.send("That's too soon — reminders need to be at least 5 minutes out.")
+        return
+    if delay > REMINDER_MAX:
+        await ctx.send("That's too far out — reminders can be at most a year away.")
+        return
+    if count_user_reminders(ctx.author.id) >= MAX_REMINDERS_PER_USER:
+        await ctx.send(
+            f"You already have {MAX_REMINDERS_PER_USER} reminders pending — cancel one first (`.remind list`)."
+        )
+        return
+
+    fire_at = discord.utils.utcnow() + delay
+    add_reminder(ctx.author.id, guild_id, ctx.channel.id, ctx.message.id, text[:1500], fire_at)
+    when = int(fire_at.timestamp())
+    await ctx.send(
+        f"Okay, I'll remind you on <t:{when}:f> to {await untag_mentions(text[:1500], ctx.guild, ctx.message.mentions)}",
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
 dildo_cooldown = commands.CooldownMapping.from_cooldown(1, 600, commands.BucketType.guild)
 
 
@@ -4138,6 +4388,57 @@ async def log_ping_back(guild: discord.Guild, member: discord.Member, sent_messa
         pass  # logging is best-effort
 
 
+@tasks.loop(seconds=15)
+async def send_due_reminders():
+    if not bot.is_ready():
+        return  # still connecting/reconnecting — everything due just waits
+    now = discord.utils.utcnow()
+    for row in get_due_reminders(now):
+        result = await _send_reminder(row, now)
+        if result == "network_down":
+            return  # leave this and everything after it for the next tick
+        if result != "retry":
+            delete_reminder(row["id"])
+
+
+async def _send_reminder(row, now: datetime) -> str:
+    """Sends one due reminder as a reply in the channel it was set in, falling
+    back to a DM if that channel is gone or off-limits. Returns "sent",
+    "dropped", "retry" or "network_down" like _send_ping_back()."""
+    # Tags are stored as-is and swapped for names only now, so the reminder
+    # shows each person's nickname as of when it fires.
+    reminder_text = await untag_mentions(row["text"], bot.get_guild(row["guild_id"]) if row["guild_id"] else None)
+    text = f"<@{row['user_id']}> reminder: {reminder_text}"
+    # The reminder text is user-written — only ever ping the person who set it.
+    allowed = discord.AllowedMentions(everyone=False, roles=False, users=[discord.Object(row["user_id"])])
+
+    try:
+        channel = bot.get_channel(row["channel_id"]) or await bot.fetch_channel(row["channel_id"])
+        reference = discord.MessageReference(
+            message_id=row["message_id"], channel_id=row["channel_id"], fail_if_not_exists=False
+        )
+        await channel.send(text, reference=reference, allowed_mentions=allowed)
+        return "sent"
+    except (discord.NotFound, discord.Forbidden):
+        pass  # channel deleted or bot lost access — try a DM instead
+    except discord.HTTPException as e:
+        if _is_temporary_http_error(e):
+            return "retry" if now - datetime.fromisoformat(row["fire_at"]) < PING_BACK_MAX_OVERDUE else "dropped"
+    except _NETWORK_ERRORS:
+        return "network_down"
+
+    try:
+        user = bot.get_user(row["user_id"]) or await bot.fetch_user(row["user_id"])
+        await user.send(text, allowed_mentions=allowed)
+        return "sent"
+    except (discord.NotFound, discord.Forbidden):
+        return "dropped"  # DMs closed or account gone
+    except discord.HTTPException as e:
+        return "retry" if _is_temporary_http_error(e) else "dropped"
+    except _NETWORK_ERRORS:
+        return "network_down"
+
+
 # ---------- lifecycle ----------
 
 @bot.event
@@ -4151,6 +4452,8 @@ async def on_ready():
         reset_tag_mute_offenses_daily.start()
     if not send_due_ping_backs.is_running():
         send_due_ping_backs.start()
+    if not send_due_reminders.is_running():
+        send_due_reminders.start()
 
     test_guild_id = os.environ.get("TEST_GUILD_ID")
     if test_guild_id:
