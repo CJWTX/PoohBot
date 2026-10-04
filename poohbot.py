@@ -265,6 +265,16 @@ def init_db():
             added_by_id INTEGER
         )"""
     )
+    # Channels ping-backs never go out in, managed by the bot owner.
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS ping_back_exempt_channels (
+            guild_id INTEGER,
+            channel_id INTEGER,
+            added_by_id INTEGER,
+            created_at TEXT,
+            PRIMARY KEY (guild_id, channel_id)
+        )"""
+    )
     # Ping scoreboard: how many messages pinger_id has explicitly tagged
     # target_id in (replies don't count). target_id is a role when
     # target_is_role is 1 (role and user IDs never collide).
@@ -300,6 +310,7 @@ def init_db():
     _migrate_add_column("guild_config", "no_quote_role_id", "INTEGER")
     _migrate_add_column("guild_config", "ping_back_role_id", "INTEGER")
     _migrate_add_column("guild_config", "ping_back_log_channel_id", "INTEGER")
+    _migrate_add_column("guild_config", "ping_back_category_id", "INTEGER")
     _migrate_add_column("ping_counts", "target_is_role", "INTEGER NOT NULL DEFAULT 0")
     _migrate_add_column("user_locations", "is_us", "INTEGER")
     _migrate_add_column("user_locations", "wind_speed_unit", "TEXT")
@@ -719,6 +730,50 @@ def set_ping_back_log_channel(guild_id: int, channel_id: int | None):
     )
     conn.commit()
     conn.close()
+
+
+def set_ping_back_category(guild_id: int, category_id: int | None):
+    conn = db_connect()
+    conn.execute(
+        "INSERT INTO guild_config (guild_id, ping_back_category_id) VALUES (?, ?) "
+        "ON CONFLICT(guild_id) DO UPDATE SET ping_back_category_id = excluded.ping_back_category_id",
+        (guild_id, category_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def add_ping_back_exempt_channel(guild_id: int, channel_id: int, added_by_id: int) -> bool:
+    """Returns False if the channel was already exempt."""
+    conn = db_connect()
+    cur = conn.execute(
+        "INSERT OR IGNORE INTO ping_back_exempt_channels (guild_id, channel_id, added_by_id, created_at) "
+        "VALUES (?, ?, ?, ?)",
+        (guild_id, channel_id, added_by_id, datetime.now(timezone.utc).isoformat()),
+    )
+    conn.commit()
+    conn.close()
+    return cur.rowcount == 1
+
+
+def remove_ping_back_exempt_channel(guild_id: int, channel_id: int) -> bool:
+    """Returns True if a row was actually removed."""
+    conn = db_connect()
+    cur = conn.execute(
+        "DELETE FROM ping_back_exempt_channels WHERE guild_id = ? AND channel_id = ?", (guild_id, channel_id)
+    )
+    conn.commit()
+    conn.close()
+    return cur.rowcount > 0
+
+
+def get_ping_back_exempt_channel_ids(guild_id: int) -> list[int]:
+    conn = db_connect()
+    rows = conn.execute(
+        "SELECT channel_id FROM ping_back_exempt_channels WHERE guild_id = ? ORDER BY created_at", (guild_id,)
+    ).fetchall()
+    conn.close()
+    return [row["channel_id"] for row in rows]
 
 
 def get_ping_back_phrases(guild_id: int):
@@ -1475,11 +1530,26 @@ PING_BACK_EXCLUDED_CATEGORIES = {"announcements"}
 
 
 def _ping_back_channels(guild: discord.Guild, member: discord.Member):
-    """Text channels the member can see and the bot can post in, outside the
-    excluded categories."""
+    """Text channels the member can see and the bot can post in — limited to
+    the /setpingbackcategory category if one's set, otherwise anywhere outside
+    the excluded categories. Channels on the exempt list are always skipped."""
+    exempt_ids = set(get_ping_back_exempt_channel_ids(guild.id))
+    row = get_config(guild.id)
+    category = None
+    if row is not None and row["ping_back_category_id"] is not None:
+        # A deleted category falls back to the whole server.
+        category = guild.get_channel(row["ping_back_category_id"])
+        if not isinstance(category, discord.CategoryChannel):
+            category = None
     channels = []
-    for channel in guild.text_channels:
-        if channel.category is not None and channel.category.name.lower() in PING_BACK_EXCLUDED_CATEGORIES:
+    for channel in (category.text_channels if category else guild.text_channels):
+        if channel.id in exempt_ids:
+            continue
+        if (
+            category is None
+            and channel.category is not None
+            and channel.category.name.lower() in PING_BACK_EXCLUDED_CATEGORIES
+        ):
             continue
         member_perms = channel.permissions_for(member)
         bot_perms = channel.permissions_for(guild.me)
@@ -2568,6 +2638,74 @@ async def setpingbacklogchannel(interaction: discord.Interaction, channel: disco
         await interaction.response.send_message(f"Ping-backs will now be logged to {channel.mention}.", ephemeral=True)
     else:
         await interaction.response.send_message("Ping-back logging turned off.", ephemeral=True)
+
+
+@bot.tree.command(
+    name="setpingbackcategory",
+    description="Only send ping-backs in channels under this category. Leave empty to allow the whole server.",
+)
+@app_commands.describe(category="The category ping-backs should stay in (leave empty to allow any channel)")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def setpingbackcategory(interaction: discord.Interaction, category: discord.CategoryChannel = None):
+    set_ping_back_category(interaction.guild_id, category.id if category else None)
+    if category:
+        await interaction.response.send_message(
+            f"Ping-backs will now only go out in channels under **{category.name}**.", ephemeral=True
+        )
+    else:
+        await interaction.response.send_message(
+            "Ping-backs can go out in any channel again.", ephemeral=True
+        )
+
+
+async def _owner_only_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.CheckFailure):
+        await interaction.response.send_message("Only the bot's owner can do this.", ephemeral=True)
+    else:
+        raise error
+
+
+@bot.tree.command(name="addpingbackexempt", description="[Bot owner only] Never send ping-backs in this channel.")
+@app_commands.describe(channel="The channel ping-backs should skip")
+@app_commands.check(_is_owner_check)
+async def addpingbackexempt(interaction: discord.Interaction, channel: discord.TextChannel):
+    if add_ping_back_exempt_channel(interaction.guild_id, channel.id, interaction.user.id):
+        await interaction.response.send_message(f"Ping-backs will no longer go out in {channel.mention}.", ephemeral=True)
+    else:
+        await interaction.response.send_message(f"{channel.mention} is already exempt from ping-backs.", ephemeral=True)
+
+
+@bot.tree.command(name="removepingbackexempt", description="[Bot owner only] Allow ping-backs in an exempt channel again.")
+@app_commands.describe(channel="The channel to take off the exempt list")
+@app_commands.check(_is_owner_check)
+async def removepingbackexempt(interaction: discord.Interaction, channel: discord.TextChannel):
+    if remove_ping_back_exempt_channel(interaction.guild_id, channel.id):
+        await interaction.response.send_message(f"Ping-backs can go out in {channel.mention} again.", ephemeral=True)
+    else:
+        await interaction.response.send_message(f"{channel.mention} wasn't on the exempt list.", ephemeral=True)
+
+
+@bot.tree.command(name="pingbackexempts", description="[Bot owner only] List the channels ping-backs never go out in.")
+@app_commands.check(_is_owner_check)
+async def pingbackexempts(interaction: discord.Interaction):
+    channel_ids = get_ping_back_exempt_channel_ids(interaction.guild_id)
+    if not channel_ids:
+        await interaction.response.send_message(
+            "No exempt channels. Add one with /addpingbackexempt.", ephemeral=True
+        )
+        return
+    lines = []
+    for channel_id in channel_ids:
+        channel = interaction.guild.get_channel(channel_id)
+        # Deleted channels stay listed so they're visible; they can't be picked anyway.
+        lines.append(channel.mention if channel else f"deleted channel (`{channel_id}`)")
+    await interaction.response.send_message(
+        "**Ping-back exempt channels:**\n" + "\n".join(f"- {line}" for line in lines), ephemeral=True
+    )
+
+
+for _command in (addpingbackexempt, removepingbackexempt, pingbackexempts):
+    _command.error(_owner_only_error)
 
 
 @bot.tree.command(
@@ -4102,6 +4240,7 @@ toggle_no_quote_webhook.error(_permission_error)
 setpingback.error(_permission_error)
 clearpingback.error(_permission_error)
 setpingbacklogchannel.error(_permission_error)
+setpingbackcategory.error(_permission_error)
 pingbackqueue.error(_permission_error)
 
 
