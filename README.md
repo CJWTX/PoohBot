@@ -35,7 +35,7 @@ To add poohbot to your server: [Click this link](https://discord.com/oauth2/auth
   Each message can only ever generate one pin request.
 
 **Quote board**
-- React 💬 (also 🗨️ or 🗯️) on any message to save it as a numbered quote —
+- React 💬 (also 🗨️ or 🗯️) on any message, or right-click it → **Apps → Save Quote**, to save it as a numbered quote —
   no setup required, no approval needed, works instantly in any channel the
   bot can read.
 - Recall one with `.q <number>` or `/quote number:`. `.q` with nothing after
@@ -105,7 +105,8 @@ To add poohbot to your server: [Click this link](https://discord.com/oauth2/auth
 - `/simonsays` — makes the bot say something in the channel; usable by
   admins or a role you configure with `/setsimonsaysrole`. Optionally log
   every use (who, what, where) to a channel with `/setsimonsayslogchannel`.
-- `/setstatus` — sets the bot's Discord activity status (bot owner only).
+- `/setstatus` — sets the bot's Discord activity status (bot owner only). Pick
+  **Custom (text only)** to show just your text with no Playing/Watching prefix.
 
 **Ping scoreboard**
 - Every explicit @tag of another user or a role is counted (once per
@@ -125,6 +126,7 @@ To add poohbot to your server: [Click this link](https://discord.com/oauth2/auth
 | Command | Who can use it | What it does |
 |---|---|---|
 | **Report Message** (right-click) | Anyone | Report a specific message |
+| **Save Quote** (right-click) | Anyone | Save a message as a quote, same as reacting 💬 |
 | `/report` | Anyone | Report a user/situation with no specific message |
 | `/reports @user` | Manage Messages | View a user's report/warning history |
 | `/dm` | Manage Messages | Message a user via the bot, opens a thread |

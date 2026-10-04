@@ -18,7 +18,8 @@ FEATURES
   - Mod action buttons on every report: Resolve, Dismiss, Escalate,
     Delete Message, Timeout, Warn
   - /reports @user - moderation history (times reported + warnings)
-  - Quote board: react 💬 to any message to save it as a numbered quote,
+  - Quote board: react 💬 to any message (or right-click -> Apps -> "Save Quote")
+    to save it as a numbered quote,
     then recall it with ".q 12" (or /quote), browse with /quotes,
     search text with ".q s <keyword>", or add one by hand with ".q add <quote> @user"
   - /setreportchannel, /setoncallrole, /setnoquoterole - per-server config
@@ -1139,6 +1140,15 @@ def is_message_quoted(guild_id: int, message_id: int) -> bool:
     return row is not None
 
 
+def get_quote_number_for_message(guild_id: int, message_id: int):
+    conn = db_connect()
+    row = conn.execute(
+        "SELECT quote_number FROM quotes WHERE guild_id = ? AND message_id = ?", (guild_id, message_id)
+    ).fetchone()
+    conn.close()
+    return row["quote_number"] if row else None
+
+
 def get_quote(guild_id: int, quote_number: int):
     conn = db_connect()
     row = conn.execute(
@@ -2163,6 +2173,41 @@ async def toggle_no_quote_webhook(interaction: discord.Interaction, message: dis
         )
 
 
+@bot.tree.context_menu(name="Save Quote")
+async def save_quote_menu(interaction: discord.Interaction, message: discord.Message):
+    """Same as reacting 💬, but without leaving a reaction on the message."""
+    if interaction.guild is None:
+        await interaction.response.send_message("Quotes only work inside a server.", ephemeral=True)
+        return
+    existing = get_quote_number_for_message(interaction.guild_id, message.id)
+    if existing is not None:
+        await interaction.response.send_message(
+            f"That message is already saved as quote #{existing}.", ephemeral=True
+        )
+        return
+    if message.author.id == interaction.user.id:
+        await interaction.response.send_message("slow down narcissist, you cant quote yourself")
+        return
+    if await is_quote_exempt(interaction.guild, message):
+        await interaction.response.send_message(
+            f"{message.author.display_name} is exempt from being quoted.", ephemeral=True
+        )
+        return
+
+    quote_number, created = save_message_as_quote(interaction.guild_id, message, interaction.user.id)
+    if quote_number is None:
+        await interaction.response.send_message("Something went wrong saving that quote — try again.", ephemeral=True)
+        return
+    if not created:
+        await interaction.response.send_message(
+            f"That message is already saved as quote #{quote_number}.", ephemeral=True
+        )
+        return
+    await interaction.response.send_message(
+        f"New quote added by {interaction.user.display_name} as #{quote_number} {message.jump_url}"
+    )
+
+
 @bot.tree.command(name="setpinrequestchannel", description="Set a separate channel for 📌 pin requests (defaults to the report channel if unset).")
 @app_commands.describe(channel="The channel pin requests should go to")
 @app_commands.checks.has_permissions(manage_guild=True)
@@ -2190,13 +2235,15 @@ async def _is_owner_check(interaction: discord.Interaction) -> bool:
     app_commands.Choice(name="Watching", value="watching"),
     app_commands.Choice(name="Listening to", value="listening"),
     app_commands.Choice(name="Competing in", value="competing"),
+    app_commands.Choice(name="Custom (text only)", value="custom"),
 ])
 @app_commands.check(_is_owner_check)
 async def setstatus(interaction: discord.Interaction, activity_type: app_commands.Choice[str], text: str):
     set_setting("status_activity_type", activity_type.value)
     set_setting("status_text", text)
     await apply_saved_status()
-    await interaction.response.send_message(f"Status updated: {activity_type.name} {text}", ephemeral=True)
+    shown = text if activity_type.value == "custom" else f"{activity_type.name} {text}"
+    await interaction.response.send_message(f"Status updated: {shown}", ephemeral=True)
 
 
 @setstatus.error
@@ -4109,6 +4156,58 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
         await handle_quote_save(payload, guild)
 
 
+async def is_quote_exempt(guild: discord.Guild, message: discord.Message) -> bool:
+    """True when this message's author (or webhook) has been exempted from
+    having their messages saved as quotes."""
+    if message.webhook_id is not None:
+        # Webhook-posted messages (custom name/avatar per send) carry no
+        # Discord member or role data, so no_quote_role can't exempt them —
+        # check the webhook-id exemption list instead.
+        return is_no_quote_webhook(guild.id, message.webhook_id)
+    no_quote_role_id = no_quote_role_id_for(guild.id)
+    if no_quote_role_id is None:
+        return False
+    author_member = message.author if isinstance(message.author, discord.Member) else None
+    if author_member is None:
+        # The REST message-fetch endpoint often omits member data (no
+        # roles), and without the privileged members intent the local
+        # cache can't be trusted either — fetch the member directly
+        # so the exemption isn't silently skipped.
+        try:
+            author_member = await guild.fetch_member(message.author.id)
+        except (discord.NotFound, discord.HTTPException):
+            author_member = None
+    return author_member is not None and any(role.id == no_quote_role_id for role in author_member.roles)
+
+
+def save_message_as_quote(guild_id: int, message: discord.Message, saved_by_id: int):
+    """Saves a real Discord message as a quote. Returns create_quote's
+    (quote_number, created)."""
+    image_url = None
+    for attachment in message.attachments:
+        if attachment.content_type and attachment.content_type.startswith("image/"):
+            image_url = attachment.url
+            break
+
+    content = message.content or ""
+    if message.attachments and not content:
+        content = f"*[{len(message.attachments)} attachment(s)]*"
+
+    return create_quote(
+        guild_id=guild_id,
+        message_id=message.id,
+        channel_id=message.channel.id,
+        author_id=message.author.id,
+        author_name=message.author.display_name,
+        content=content,
+        image_url=image_url,
+        jump_url=message.jump_url,
+        saved_by_id=saved_by_id,
+        message_created_at=message.created_at.isoformat(),
+        created_at=datetime.now(timezone.utc).isoformat(),
+    )
+
+
 async def handle_quote_save(payload: discord.RawReactionActionEvent, guild: discord.Guild):
     try:
         channel = guild.get_channel(payload.channel_id) or await guild.fetch_channel(payload.channel_id)
@@ -4129,51 +4228,10 @@ async def handle_quote_save(payload: discord.RawReactionActionEvent, guild: disc
             pass
         return
 
-    if message.webhook_id is not None:
-        # Webhook-posted messages (custom name/avatar per send) carry no
-        # Discord member or role data, so no_quote_role can't exempt them —
-        # check the webhook-id exemption list instead.
-        if is_no_quote_webhook(payload.guild_id, message.webhook_id):
-            return
-    else:
-        no_quote_role_id = no_quote_role_id_for(payload.guild_id)
-        if no_quote_role_id is not None:
-            author_member = message.author if isinstance(message.author, discord.Member) else None
-            if author_member is None:
-                # The REST message-fetch endpoint often omits member data (no
-                # roles), and without the privileged members intent the local
-                # cache can't be trusted either — fetch the member directly
-                # so the exemption isn't silently skipped.
-                try:
-                    author_member = await guild.fetch_member(message.author.id)
-                except (discord.NotFound, discord.HTTPException):
-                    author_member = None
-            if author_member is not None and any(role.id == no_quote_role_id for role in author_member.roles):
-                return  # this author is exempt from being quoted
+    if await is_quote_exempt(guild, message):
+        return
 
-    image_url = None
-    for attachment in message.attachments:
-        if attachment.content_type and attachment.content_type.startswith("image/"):
-            image_url = attachment.url
-            break
-
-    content = message.content or ""
-    if message.attachments and not content:
-        content = f"*[{len(message.attachments)} attachment(s)]*"
-
-    quote_number, created = create_quote(
-        guild_id=payload.guild_id,
-        message_id=payload.message_id,
-        channel_id=payload.channel_id,
-        author_id=message.author.id,
-        author_name=message.author.display_name,
-        content=content,
-        image_url=image_url,
-        jump_url=message.jump_url,
-        saved_by_id=payload.user_id,
-        message_created_at=message.created_at.isoformat(),
-        created_at=datetime.now(timezone.utc).isoformat(),
-    )
+    quote_number, created = save_message_as_quote(payload.guild_id, message, payload.user_id)
     if quote_number is None or not created:
         return  # couldn't allocate a number, or already quoted — stay quiet
 
@@ -4292,6 +4350,10 @@ DEFAULT_STATUS_TEXT = "for reports"
 async def apply_saved_status():
     activity_type_key = get_setting("status_activity_type", DEFAULT_STATUS_TYPE)
     text = get_setting("status_text", DEFAULT_STATUS_TEXT)
+    if activity_type_key == "custom":
+        # Custom status shows just the text, with no "Playing"/"Watching" prefix.
+        await bot.change_presence(activity=discord.CustomActivity(name=text))
+        return
     activity_type = ACTIVITY_TYPE_MAP.get(activity_type_key, discord.ActivityType.watching)
     await bot.change_presence(activity=discord.Activity(type=activity_type, name=text))
 
