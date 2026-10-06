@@ -236,8 +236,8 @@ def init_db():
         )"""
     )
     # Users the bot owner has designated to get pinged back: every message
-    # where they tag someone queues two pings of their own, each at a random
-    # time in a random channel they can see.
+    # where they tag someone queues pings_per_tag pings of their own (two if
+    # unset), each at a random time in a random channel they can see.
     conn.execute(
         """CREATE TABLE IF NOT EXISTS ping_back_watch (
             guild_id INTEGER,
@@ -311,6 +311,7 @@ def init_db():
     _migrate_add_column("guild_config", "ping_back_role_id", "INTEGER")
     _migrate_add_column("guild_config", "ping_back_log_channel_id", "INTEGER")
     _migrate_add_column("guild_config", "ping_back_category_id", "INTEGER")
+    _migrate_add_column("ping_back_watch", "pings_per_tag", "INTEGER")
     _migrate_add_column("ping_counts", "target_is_role", "INTEGER NOT NULL DEFAULT 0")
     _migrate_add_column("user_locations", "is_us", "INTEGER")
     _migrate_add_column("user_locations", "wind_speed_unit", "TEXT")
@@ -632,13 +633,20 @@ def reset_tag_mute_offense(guild_id: int, user_id: int) -> bool:
     return cur.rowcount > 0
 
 
-def add_ping_back_watch(guild_id: int, user_id: int, added_by_id: int) -> bool:
-    """Returns False (no-op) if the user was already on the watch list."""
+def add_ping_back_watch(guild_id: int, user_id: int, added_by_id: int, pings_per_tag: int | None) -> bool:
+    """Returns False if the user was already on the watch list. Either way, a
+    given pings_per_tag replaces theirs; None leaves it as it was."""
     conn = db_connect()
     cur = conn.execute(
-        "INSERT OR IGNORE INTO ping_back_watch (guild_id, user_id, added_by_id, created_at) VALUES (?, ?, ?, ?)",
-        (guild_id, user_id, added_by_id, datetime.now(timezone.utc).isoformat()),
+        "INSERT OR IGNORE INTO ping_back_watch (guild_id, user_id, added_by_id, created_at, pings_per_tag) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (guild_id, user_id, added_by_id, datetime.now(timezone.utc).isoformat(), pings_per_tag),
     )
+    if cur.rowcount == 0 and pings_per_tag is not None:
+        conn.execute(
+            "UPDATE ping_back_watch SET pings_per_tag = ? WHERE guild_id = ? AND user_id = ?",
+            (pings_per_tag, guild_id, user_id),
+        )
     conn.commit()
     conn.close()
     return cur.rowcount > 0
@@ -657,13 +665,16 @@ def remove_ping_back_watch(guild_id: int, user_id: int) -> tuple[bool, int]:
     return cur.rowcount > 0, cancelled
 
 
-def is_ping_back_watched(guild_id: int, user_id: int) -> bool:
+def get_ping_backs_per_tag(guild_id: int, user_id: int) -> int | None:
+    """How many pings each of the user's tags queues, or None if they aren't watched."""
     conn = db_connect()
     row = conn.execute(
-        "SELECT 1 FROM ping_back_watch WHERE guild_id = ? AND user_id = ?", (guild_id, user_id)
+        "SELECT pings_per_tag FROM ping_back_watch WHERE guild_id = ? AND user_id = ?", (guild_id, user_id)
     ).fetchone()
     conn.close()
-    return row is not None
+    if row is None:
+        return None
+    return row["pings_per_tag"] or PING_BACKS_PER_TAG
 
 
 def queue_ping_backs(guild_id: int, user_id: int, fire_times: list[datetime]):
@@ -1477,7 +1488,8 @@ def track_pings(message: discord.Message):
 
 # ---------- ping-back watch list ----------
 
-PING_BACKS_PER_TAG = 2
+PING_BACKS_PER_TAG = 2  # default; /setpingback can set a different count per user
+PING_BACKS_PER_TAG_MAX = 10
 PING_BACK_MIN_DELAY_SECONDS = 60
 PING_BACK_MAX_DELAY_SECONDS = 24 * 60 * 60
 PING_BACK_PHRASES = [
@@ -1498,9 +1510,12 @@ PING_BACK_PHRASES = [
 
 def maybe_queue_ping_backs(message: discord.Message):
     """If the author is on the ping-back watch list and this message tags
-    someone (an explicit @mention, not a reply), queues PING_BACKS_PER_TAG
+    someone (an explicit @mention, not a reply), queues their pings_per_tag
     pings of them at random times over the next day."""
-    if message.guild is None or not is_ping_back_watched(message.guild.id, message.author.id):
+    if message.guild is None:
+        return
+    count = get_ping_backs_per_tag(message.guild.id, message.author.id)
+    if count is None:
         return
     if not ping_targets(message):
         return
@@ -1510,7 +1525,7 @@ def maybe_queue_ping_backs(message: discord.Message):
         message.author.id,
         [
             now + timedelta(seconds=random.randint(PING_BACK_MIN_DELAY_SECONDS, PING_BACK_MAX_DELAY_SECONDS))
-            for _ in range(PING_BACKS_PER_TAG)
+            for _ in range(count)
         ],
     )
 
@@ -1523,6 +1538,44 @@ def format_ping_back_phrase(phrase: str, mention: str) -> str:
     if "{mention}" in phrase:
         return phrase.replace("{mention}", mention)
     return f"{mention} {phrase}"
+
+
+class PingBackPhraseDeck:
+    """Like ResponseDeck, but for a server's phrases, which can be added and
+    removed while a deck is half dealt. Tracks phrase ids: removed ones drop
+    out of the deck, new ones get shuffled into what's left of it."""
+
+    def __init__(self):
+        self.deck: list[int] = []
+        self.dealt: set[int] = set()
+        self.last: int | None = None
+
+    def next(self, phrase_ids: list[int]) -> int:
+        current = set(phrase_ids)
+        self.deck = [phrase_id for phrase_id in self.deck if phrase_id in current]
+        for phrase_id in current - set(self.deck) - self.dealt:
+            self.deck.insert(random.randint(0, len(self.deck)), phrase_id)
+        if not self.deck:
+            self.deck = list(phrase_ids)
+            self.dealt = set()
+            random.shuffle(self.deck)
+            # The deck is dealt from the end, so that's the slot to check.
+            if len(self.deck) > 1 and self.deck[-1] == self.last:
+                self.deck[0], self.deck[-1] = self.deck[-1], self.deck[0]
+        self.last = self.deck.pop()
+        self.dealt.add(self.last)
+        return self.last
+
+
+# Keyed by guild id. Lives in memory, so a restart just starts a fresh deck.
+PING_BACK_PHRASE_DECKS: dict[int, PingBackPhraseDeck] = {}
+
+
+def next_ping_back_phrase(guild_id: int, phrases) -> str:
+    """Every phrase gets used once before any repeats, and never twice in a row."""
+    by_id = {row["id"]: row["phrase"] for row in phrases}
+    deck = PING_BACK_PHRASE_DECKS.setdefault(guild_id, PingBackPhraseDeck())
+    return by_id[deck.next(list(by_id))]
 
 
 # Channels under a category with one of these names (case-insensitive) never get ping-backs.
@@ -2710,19 +2763,32 @@ for _command in (addpingbackexempt, removepingbackexempt, pingbackexempts):
 
 @bot.tree.command(
     name="setpingback",
-    description="Every time a user tags someone, ping them twice at random times and places.",
+    description="Every time a user tags someone, ping them back at random times and places.",
 )
-@app_commands.describe(user="The user to watch")
+@app_commands.describe(
+    user="The user to watch",
+    pings=f"Pings queued per tag, 1-{PING_BACKS_PER_TAG_MAX} (default {PING_BACKS_PER_TAG}). "
+    "Run again to change it for someone already on the list.",
+)
 @app_commands.checks.has_permissions(manage_messages=True)
-async def setpingback(interaction: discord.Interaction, user: discord.Member):
-    if add_ping_back_watch(interaction.guild_id, user.id, interaction.user.id):
-        await interaction.response.send_message(
-            f"Every time {user.mention} tags someone in this server, they'll get pinged {PING_BACKS_PER_TAG} times "
-            f"at random times over the next day, in random channels they can see.",
-            ephemeral=True,
+async def setpingback(
+    interaction: discord.Interaction,
+    user: discord.Member,
+    pings: app_commands.Range[int, 1, PING_BACKS_PER_TAG_MAX] = None,
+):
+    added = add_ping_back_watch(interaction.guild_id, user.id, interaction.user.id, pings)
+    count = get_ping_backs_per_tag(interaction.guild_id, user.id)
+    times = f"{count} time{'s' if count != 1 else ''}"
+    if added:
+        message = (
+            f"Every time {user.mention} tags someone in this server, they'll get pinged {times} "
+            f"at random times over the next day, in random channels they can see."
         )
+    elif pings is not None:
+        message = f"{user.mention} will now get pinged {times} per tag. Pings already queued aren't changed."
     else:
-        await interaction.response.send_message(f"{user.mention} is already on the ping-back list.", ephemeral=True)
+        message = f"{user.mention} is already on the ping-back list ({times} per tag)."
+    await interaction.response.send_message(message, ephemeral=True)
 
 
 @bot.tree.command(
@@ -2799,13 +2865,14 @@ async def addpingbackphrase(
 
 
 @bot.tree.command(name="pingbackphrases", description="[Owner/ping-back role] List this server's ping-back phrases.")
+@app_commands.describe(public="Post the list in the channel instead of only showing it to you")
 @app_commands.check(_can_use_ping_back)
-async def pingbackphrases(interaction: discord.Interaction):
+async def pingbackphrases(interaction: discord.Interaction, public: bool = False):
     rows = get_ping_back_phrases(interaction.guild_id)
     if not rows:
         await interaction.response.send_message(
             "No ping-back phrases left. Add one with /addpingbackphrase, or ping-backs won't be sent.",
-            ephemeral=True,
+            ephemeral=not public,
         )
         return
     lines = [f"`{i}.` {discord.utils.escape_markdown(row['phrase'])}" for i, row in enumerate(rows, start=1)]
@@ -2822,9 +2889,9 @@ async def pingbackphrases(interaction: discord.Interaction):
             title="Ping-back phrases" if i == 0 else None, description=chunk, color=discord.Color.blurple()
         )
         if i == 0:
-            await interaction.response.send_message(embed=embed, ephemeral=True)
+            await interaction.response.send_message(embed=embed, ephemeral=not public)
         else:
-            await interaction.followup.send(embed=embed, ephemeral=True)
+            await interaction.followup.send(embed=embed, ephemeral=not public)
 
 
 @bot.tree.command(
@@ -4552,7 +4619,7 @@ async def _send_ping_back(row, now: datetime) -> str:
     if not channels or not phrases:
         return "dropped"
     channel = random.choice(channels)
-    text = format_ping_back_phrase(random.choice(phrases)["phrase"], member.mention)
+    text = format_ping_back_phrase(next_ping_back_phrase(guild.id, phrases), member.mention)
     try:
         sent_message = await channel.send(
             text,
