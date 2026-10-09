@@ -121,6 +121,19 @@ To add poohbot to your server: [Click this link](https://discord.com/oauth2/auth
   background and posts a summary when done; live counting keeps going
   meanwhile. Deleted messages and channels the bot can't read are missed.
 
+**Message leaderboard and channel stats**
+- Every server message from a person is counted (bots aren't), over a
+  rolling 7-day window. Messages in threads and forum posts count toward
+  their parent channel.
+- `/leaderboard` shows the top 10 message senders this week and where you
+  rank; `/leaderboard user:` shows someone else's rank instead.
+- `/channelstats` shows the 10 busiest channels this week;
+  `/channelstats channel:` shows one channel's message count, rank, number of
+  posters and top posters. It's only shown to you unless you pass
+  `public:True`, and only lists channels you can see.
+- `backfill_messages.py` (run separately, not a bot command) fills the counts
+  from the last 7 days of history — see Data.
+
 ## Commands
 
 | Command | Who can use it | What it does |
@@ -161,6 +174,8 @@ To add poohbot to your server: [Click this link](https://discord.com/oauth2/auth
 | `/setnoquoterole` | Manage Server | Exempt a role's members from being quoted |
 | `/pingscoreboard` / `/pingscoreboard user:` | Anyone | Leaderboard of who tags people most (and who gets tagged most), or one user's ping stats |
 | `/backfillpings` | Bot owner | Rebuild the ping scoreboard from message history (replaces current counts) |
+| `/leaderboard` / `/leaderboard user:` | Anyone | Top message senders over the last 7 days, and your (or someone's) rank |
+| `/channelstats` / `/channelstats channel:` | Anyone | Busiest channels over the last 7 days, or one channel's stats and top posters |
 | **Toggle No-Quote Webhook** (right-click) | Manage Server | Exempt/un-exempt a webhook's messages from being quoted |
 
 Channel settings (`setpinrequestchannel`, `setdmchannel`) fall back to the
@@ -232,6 +247,12 @@ Migrating from another quote bot? `python3 import_quotes.py quotes.json`
 bulk-loads a JSON export into `poohbot.db`, preserving original quote
 numbers and skipping anything already imported — see the script's docstring
 for options.
+
+The leaderboard and channel stats only count messages the bot sees live. To
+fill them from history (on first setup, or after the bot was down), run
+`venv/bin/python backfill_messages.py` from the bot's folder. It reads the
+last 7 days up to the moment the bot last started counting, so it's safe to
+run while the bot is up and safe to re-run.
 
 ## Notes
 

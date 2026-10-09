@@ -287,6 +287,21 @@ def init_db():
             PRIMARY KEY (guild_id, pinger_id, target_id)
         )"""
     )
+    # Messages each user has sent per channel, bucketed by UTC hour ("2026-10-09T15")
+    # so /leaderboard and /channelstats can sum a rolling window. Thread messages
+    # count toward their parent channel. Bots aren't counted; hours older than
+    # the window get pruned. pre_live is how much of the hour's count came from
+    # before live counting last (re)started; see mark_live_counting_started().
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS channel_message_counts (
+            guild_id INTEGER,
+            channel_id INTEGER,
+            user_id INTEGER,
+            hour TEXT,
+            count INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (guild_id, channel_id, user_id, hour)
+        )"""
+    )
     # .remind me reminders. guild_id is NULL for ones set in DMs; message_id
     # is the .remind command message, which the reminder replies to.
     conn.execute(
@@ -315,6 +330,7 @@ def init_db():
     _migrate_add_column("ping_counts", "target_is_role", "INTEGER NOT NULL DEFAULT 0")
     _migrate_add_column("user_locations", "is_us", "INTEGER")
     _migrate_add_column("user_locations", "wind_speed_unit", "TEXT")
+    _migrate_add_column("channel_message_counts", "pre_live", "INTEGER NOT NULL DEFAULT 0")
 
 
 def _migrate_add_column(table: str, column: str, col_type: str):
@@ -936,6 +952,116 @@ def get_top_pinged(guild_id: int, limit: int = 10, roles: bool = False):
     ).fetchall()
     conn.close()
     return rows
+
+
+LEADERBOARD_DAYS = 7
+
+
+def message_hour(when: datetime) -> str:
+    """The channel_message_counts bucket a time falls in."""
+    return when.astimezone(timezone.utc).strftime("%Y-%m-%dT%H")
+
+
+def leaderboard_window_start() -> str:
+    """The oldest hour bucket /leaderboard and /channelstats still count."""
+    return message_hour(datetime.now(timezone.utc) - timedelta(days=LEADERBOARD_DAYS))
+
+
+def stats_channel_id(channel) -> int:
+    """The channel a message counts toward: a thread's parent, otherwise itself."""
+    return channel.parent_id if isinstance(channel, discord.Thread) else channel.id
+
+
+def mark_live_counting_started():
+    """Notes when live counting (re)started, for backfill_messages.py: history
+    before this moment comes from the backfill, everything after from
+    on_message. Counts already in this hour's bucket are from before it, so
+    they're marked pre_live for the backfill to swap out for what it reads."""
+    now = datetime.now(timezone.utc)
+    conn = db_connect()
+    conn.execute("UPDATE channel_message_counts SET pre_live = count WHERE hour = ?", (message_hour(now),))
+    conn.execute(
+        "INSERT INTO bot_settings (key, value) VALUES ('message_counts_live_since', ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (now.isoformat(),),
+    )
+    conn.commit()
+    conn.close()
+
+
+def record_message(message: discord.Message):
+    conn = db_connect()
+    conn.execute(
+        "INSERT INTO channel_message_counts (guild_id, channel_id, user_id, hour, count) VALUES (?, ?, ?, ?, 1) "
+        "ON CONFLICT(guild_id, channel_id, user_id, hour) DO UPDATE SET count = count + 1",
+        (message.guild.id, stats_channel_id(message.channel), message.author.id, message_hour(message.created_at)),
+    )
+    conn.commit()
+    conn.close()
+
+
+def prune_message_counts(guild_id: int):
+    conn = db_connect()
+    conn.execute(
+        "DELETE FROM channel_message_counts WHERE guild_id = ? AND hour < ?", (guild_id, leaderboard_window_start())
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_top_message_senders(guild_id: int, limit: int = 10):
+    conn = db_connect()
+    rows = conn.execute(
+        "SELECT user_id, 0 AS is_role, SUM(count) AS total FROM channel_message_counts "
+        "WHERE guild_id = ? AND hour >= ? GROUP BY user_id ORDER BY total DESC LIMIT ?",
+        (guild_id, leaderboard_window_start(), limit),
+    ).fetchall()
+    conn.close()
+    return rows
+
+
+def get_message_rank(guild_id: int, user_id: int) -> tuple[int, int] | None:
+    """(messages sent, leaderboard rank) for the user in the window, or None if they haven't sent any."""
+    start = leaderboard_window_start()
+    conn = db_connect()
+    total = conn.execute(
+        "SELECT SUM(count) FROM channel_message_counts WHERE guild_id = ? AND user_id = ? AND hour >= ?",
+        (guild_id, user_id, start),
+    ).fetchone()[0]
+    if not total:
+        conn.close()
+        return None
+    ahead = conn.execute(
+        "SELECT COUNT(*) FROM (SELECT SUM(count) AS total FROM channel_message_counts "
+        "WHERE guild_id = ? AND hour >= ? GROUP BY user_id) WHERE total > ?",
+        (guild_id, start, total),
+    ).fetchone()[0]
+    conn.close()
+    return total, ahead + 1
+
+
+def get_channel_totals(guild_id: int):
+    """[(channel_id, messages)] for every channel with messages in the window, busiest first."""
+    conn = db_connect()
+    rows = conn.execute(
+        "SELECT channel_id, SUM(count) AS total FROM channel_message_counts "
+        "WHERE guild_id = ? AND hour >= ? GROUP BY channel_id ORDER BY total DESC",
+        (guild_id, leaderboard_window_start()),
+    ).fetchall()
+    conn.close()
+    return [(row["channel_id"], row["total"]) for row in rows]
+
+
+def get_channel_top_posters(guild_id: int, channel_id: int, limit: int = 5):
+    """(number of people who posted, their top `limit` rows) for one channel in the window."""
+    conn = db_connect()
+    rows = conn.execute(
+        "SELECT user_id, 0 AS is_role, SUM(count) AS total FROM channel_message_counts "
+        "WHERE guild_id = ? AND channel_id = ? AND hour >= ? GROUP BY user_id ORDER BY total DESC",
+        (guild_id, channel_id, leaderboard_window_start()),
+    ).fetchall()
+    conn.close()
+    return len(rows), rows[:limit]
 
 
 def get_ping_stats_for_user(guild_id: int, user_id: int, limit: int = 5) -> dict:
@@ -2474,6 +2600,96 @@ def _format_ping_rows(rows) -> str:
         f"{medals.get(i, f'`{i}.`')} <@{'&' if row['is_role'] else ''}{row['user_id']}> — {row['total']}"
         for i, row in enumerate(rows, start=1)
     ) or "*nobody yet*"
+
+
+@bot.tree.command(name="leaderboard", description=f"See who's sent the most messages here in the last {LEADERBOARD_DAYS} days.")
+@app_commands.describe(user="Show where this user ranks (defaults to you)")
+async def leaderboard(interaction: discord.Interaction, user: discord.Member = None):
+    prune_message_counts(interaction.guild_id)
+    top = get_top_message_senders(interaction.guild_id)
+    if not top:
+        await interaction.response.send_message(
+            f"Nobody has sent any messages in the last {LEADERBOARD_DAYS} days.", ephemeral=True
+        )
+        return
+    embed = discord.Embed(
+        title=f"Message leaderboard — {interaction.guild.name}",
+        description=_format_ping_rows(top),
+        color=discord.Color.blurple(),
+    )
+    user = user or interaction.user
+    rank = get_message_rank(interaction.guild_id, user.id)
+    if rank is None:
+        standing = f"{user.mention} hasn't sent any messages in the last {LEADERBOARD_DAYS} days."
+    else:
+        count, place = rank
+        standing = f"{user.mention} is **#{place}** with **{count}** message(s)."
+    embed.add_field(name="\u200b", value=standing, inline=False)
+    embed.set_footer(text=f"Last {LEADERBOARD_DAYS} days · bots aren't counted")
+    # Mentions inside an embed never notify anyone, so the leaderboard doesn't ping the people on it.
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="channelstats", description=f"See the busiest channels, or one channel's stats, for the last {LEADERBOARD_DAYS} days.")
+@app_commands.describe(
+    channel="Show this channel's stats instead of the busiest channels",
+    public="Post the stats in the channel instead of only showing them to you",
+)
+async def channelstats(
+    interaction: discord.Interaction,
+    channel: discord.TextChannel | discord.VoiceChannel | discord.StageChannel | discord.ForumChannel = None,
+    public: bool = False,
+):
+    prune_message_counts(interaction.guild_id)
+    # Only channels the person asking can see, so hidden channels' activity doesn't leak.
+    visible = []
+    for channel_id, total in get_channel_totals(interaction.guild_id):
+        found = interaction.guild.get_channel(channel_id)
+        if found is not None and found.permissions_for(interaction.user).view_channel:
+            visible.append((found, total))
+
+    if channel is None:
+        if not visible:
+            await interaction.response.send_message(
+                f"No messages in the last {LEADERBOARD_DAYS} days.", ephemeral=True
+            )
+            return
+        medals = {1: "🥇", 2: "🥈", 3: "🥉"}
+        lines = [
+            f"{medals.get(i, f'`{i}.`')} {found.mention} — {total}"
+            for i, (found, total) in enumerate(visible[:10], start=1)
+        ]
+        embed = discord.Embed(
+            title=f"Busiest channels — {interaction.guild.name}",
+            description="\n".join(lines),
+            color=discord.Color.blurple(),
+        )
+        embed.add_field(
+            name="\u200b",
+            value=f"**{sum(total for _, total in visible)}** message(s) across **{len(visible)}** channel(s).",
+            inline=False,
+        )
+    else:
+        if not channel.permissions_for(interaction.user).view_channel:
+            await interaction.response.send_message("You can't see that channel.", ephemeral=True)
+            return
+        place = next((i for i, (found, _) in enumerate(visible, start=1) if found.id == channel.id), None)
+        if place is None:
+            await interaction.response.send_message(
+                f"{channel.mention} has no messages in the last {LEADERBOARD_DAYS} days.", ephemeral=not public
+            )
+            return
+        total = visible[place - 1][1]
+        posters, top = get_channel_top_posters(interaction.guild_id, channel.id)
+        embed = discord.Embed(
+            title=f"Channel stats — #{channel.name}",
+            description=f"**{total}** message(s) from **{posters}** member(s) · **#{place}** of {len(visible)} channels",
+            color=discord.Color.blurple(),
+        )
+        embed.add_field(name="Top posters", value=_format_ping_rows(top), inline=False)
+    embed.set_footer(text=f"Last {LEADERBOARD_DAYS} days · threads count toward their channel · bots aren't counted")
+    # Mentions inside an embed never notify anyone.
+    await interaction.response.send_message(embed=embed, ephemeral=not public)
 
 
 @bot.tree.command(name="pingscoreboard", description="See who tags people the most (replies don't count).")
@@ -4510,6 +4726,7 @@ async def on_message(message: discord.Message):
         return
     if message.guild is not None:  # everything past this point only handles DMs
         await maybe_reply_bot_feedback(message)
+        record_message(message)
         track_pings(message)
         maybe_queue_ping_backs(message)
         await maybe_tag_mute(message)
@@ -4715,6 +4932,8 @@ async def on_ready():
     bot.add_view(PinRequestView())
     await apply_saved_status()
     await bot.is_owner(bot.user)  # fills in bot.owner_id/owner_ids for is_bot_owner()
+    # Also runs after a reconnect, so a backfill can fill whatever was missed while disconnected.
+    mark_live_counting_started()
 
     if not reset_tag_mute_offenses_daily.is_running():
         reset_tag_mute_offenses_daily.start()
